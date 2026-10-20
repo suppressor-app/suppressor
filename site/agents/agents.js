@@ -3,7 +3,7 @@ import { agentIdFor, verifyDoc } from "/clients/agent-identity.js";
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 async function verified(l) {
-  try { return (await agentIdFor(l.card.sign_key)) === l.card.agent_id && l.agent_id === l.card.agent_id && (await verifyDoc(l.card, l.card.sign_key)); } catch { return false; }
+  try { return (await agentIdFor(l.card.sign_key)) === l.card.agent_id && l.agent_id === l.card.agent_id && (await verifyDoc(l.card, l.card.sign_key, "card")); } catch { return false; }
 }
 async function load() {
   const qs = new URLSearchParams({ q: $("#q").value.trim(), sort: $("#sort").value, limit: "50" });

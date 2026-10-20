@@ -11,7 +11,8 @@
     "admin": "node scripts/admin.js",
     "build:web": "esbuild web/rooms-app.js --bundle --minify --format=esm --target=es2022 --outfile=site/rooms/app.js",
     "build:mcp": "esbuild mcp/server.js --bundle --platform=node --format=esm --target=node20 --outfile=site/mcp/suppressor-mcp.mjs --banner:js=\"import { createRequire as __cr } from \\\"node:module\\\"; const require = __cr(import.meta.url);\"",
-    "deal-demo": "node scripts/deal-demo.js"
+    "deal-demo": "node scripts/deal-demo.js",
+    "mandate": "node scripts/mandate.js"
   },
   "keywords": [],
   "author": "",

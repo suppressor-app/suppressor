@@ -151,10 +151,10 @@ t("pay-per-room rooms cap at 7 days", () => {
   const AS = await import("../src/agents/store.js");
   const a = await I.generateAgentIdentity(), b = await I.generateAgentIdentity();
   // identity + signed docs
-  const doc = await I.signDoc(a, { hello: "world", n: 1 });
-  assert.ok(await I.verifyDoc(doc, a.sign_key));
-  assert.ok(!(await I.verifyDoc({ ...doc, n: 2 }, a.sign_key)), "tampered doc must fail");
-  assert.ok(!(await I.verifyDoc(doc, b.sign_key)), "wrong key must fail");
+  const doc = await I.signDoc(a, { hello: "world", n: 1 }, "hello");
+  assert.ok(await I.verifyDoc(doc, a.sign_key, "hello"));
+  assert.ok(!(await I.verifyDoc({ ...doc, n: 2 }, a.sign_key, "hello")), "tampered doc must fail");
+  assert.ok(!(await I.verifyDoc(doc, b.sign_key, "hello")), "wrong key must fail");
   assert.equal(await I.agentIdFor(a.sign_key), a.agent_id);
   // signed requests: bound to method+path+body; nonce can't be reused; stale time refused
   const h = I.parseAgentHeader(await I.signRequest(a, "GET", "/v1/agents/x/inbox", ""));
@@ -173,7 +173,7 @@ t("pay-per-room rooms cap at 7 days", () => {
   const agentA = await SDK.SuppressorAgent.create({ baseUrl: "http://x", identity: a });
   const card = await agentA.makeCard({ name: "Research A", services: [{ id: "brief", title: "Market brief", category: "research", price: { model: "fixed", usd: 2 } }], payment: { network: "eip155:8453", asset: "USDC", pay_to: "0x" + "1".repeat(40) } });
   assert.equal(AS.validateCard(card), null);
-  assert.ok(await I.verifyDoc(card, card.sign_key));
+  assert.ok(await I.verifyDoc(card, card.sign_key, "card"));
   const forged = { ...card, agent_id: b.agent_id };
   assert.notEqual(await I.agentIdFor(forged.sign_key), forged.agent_id, "agent_id can't be claimed with someone else's key");
   assert.ok(!(await SDK.SuppressorAgent.verifyListing({ agent_id: card.agent_id, card: { ...card, name: "Evil" } })));
@@ -310,7 +310,7 @@ t("pay-per-room rooms cap at 7 days", () => {
   // a stranger in the room can't accept, and can't speak for the seller
   const t1 = await offer();
   await M.ag.dealMsg(M.room, "accept", { deal_id: t1.deal_id, terms_hash: (await B.ag.deal(B.room, t1.deal_id)).terms_hash });
-  await M.ag.post(M.room, await signDoc(M.ag.id, { type: "deal", kind: "accept", agent_id: Sl.ag.agentId, ts: new Date().toISOString(), deal_id: t1.deal_id, terms_hash: (await B.ag.deal(B.room, t1.deal_id)).terms_hash }));
+  await M.ag.post(M.room, await signDoc(M.ag.id, { type: "deal", kind: "accept", agent_id: Sl.ag.agentId, ts: new Date().toISOString(), deal_id: t1.deal_id, terms_hash: (await B.ag.deal(B.room, t1.deal_id)).terms_hash }, "deal"));
   assert.equal(await status(t1.deal_id), "proposed", "accept from a non-party or an impostor doesn't count");
   // an accept of stale terms doesn't count
   const stale = (await B.ag.deal(B.room, t1.deal_id)).terms_hash;
@@ -342,6 +342,87 @@ t("pay-per-room rooms cap at 7 days", () => {
   assert.equal(await status(t2.deal_id), "expired", "tampered ciphertext is dropped, not believed");
   console.log("ok abuse cases: impostor and non-party accepts, stale accepts, locked terms, seller-reported payment, tampered and late messages"); n++;
 
+  // Owner mandates: signed by an owner key, checked by the seller, enforced on the buyer's payments.
+  const { createMandate, checkMandate } = await import("../clients/suppressor-sdk.js");
+  const I2 = await import("../clients/agent-identity.js");
+  const owner = await I2.generateOwnerKey(), stranger = await I2.generateOwnerKey();
+  const mandate = await createMandate(owner, { agent_id: B.ag.agentId, max_per_deal_usd: 1.5, max_total_usd: 2, allowed_sellers: [Sl.ag.agentId] });
+  const covered = { ...t1, price_usd: 1 };
+  assert.equal(mandate.sig_v, 2, "mandates are always signed labeled");
+  assert.equal(await checkMandate(mandate, { agent_id: B.ag.agentId, terms: covered }), null);
+  assert.match(await checkMandate({ ...mandate, max_per_deal_usd: 1.9 }, { terms: covered }), /signature/, "raised limit breaks the owner signature");
+  assert.match(await checkMandate({ ...mandate, owner_id: stranger.owner_id }, {}), /owner_sign_key/);
+  assert.match(await checkMandate(mandate, { agent_id: M.ag.agentId }), /different agent/, "another agent can't reuse it");
+  assert.match(await checkMandate(mandate, { terms: { ...covered, price_usd: 2 } }), /per deal/);
+  assert.match(await checkMandate(mandate, { terms: { ...covered, seller: M.ag.agentId } }), /seller/);
+  assert.match(await checkMandate(mandate, { now: Date.now() + 31 * 86400e3 }), /valid now/, "expired");
+  assert.match(await checkMandate(mandate, { trustedOwners: [stranger.owner_id] }), /don't trust/);
+  const { sig: _s, sig_v: _v, ...plainBody } = mandate;
+  const plainSig = await I2.signBytes(owner, new TextEncoder().encode(I2.canonical(plainBody)));
+  assert.match(await checkMandate({ ...plainBody, sig: plainSig }, {}), /signature/, "an unlabeled mandate signature is refused");
+  await assert.rejects(createMandate(owner, { agent_id: B.ag.agentId, max_per_deal_usd: 5, max_total_usd: 1 }), /over max_total/);
+  // seller requires a mandate: none → refused; a covering one → accepted; buyer can't offer past its own mandate
+  Sl.ag.requireMandate = true;
+  const t3 = await offer();
+  await assert.rejects(Sl.ag.accept(Sl.room, t3.deal_id), /hasn't shown an owner mandate/);
+  B.ag.mandate = mandate;
+  const t4 = await offer();
+  assert.equal((await Sl.ag.deal(Sl.room, t4.deal_id)).mandate.mandate_id, mandate.mandate_id);
+  await Sl.ag.accept(Sl.room, t4.deal_id);
+  assert.equal(await status(t4.deal_id), "agreed");
+  await assert.rejects(offer({ price_usd: 3 }), /mandate doesn't cover/);
+  const mt = { ...t4, deal_id: "dl_mallorymdt1", buyer: M.ag.agentId, version: 1 };
+  await M.ag.dealMsg(M.room, "offer", { deal_id: mt.deal_id, terms: mt, terms_hash: await (await import("../clients/suppressor-sdk.js")).termsHash(mt), mandate });
+  await assert.rejects(Sl.ag.accept(Sl.room, "dl_mallorymdt1"), /different agent/, "a copied mandate doesn't work for another agent");
+  Sl.ag.trustedOwners = [stranger.owner_id];
+  await assert.rejects(Sl.ag.checkBuyerMandate(await Sl.ag.deal(Sl.room, t4.deal_id)), /don't trust/, "seller can limit which owner keys it accepts");
+  Sl.ag.trustedOwners = []; Sl.ag.requireMandate = false;
+  // buyer: the mandate's total is enforced against what was already paid under it
+  B.ag.policy.ledger.push({ at: new Date().toISOString(), usd: 1.5, to_agent: Sl.ag.agentId, deal_id: "dl_earlier1", mandate_id: mandate.mandate_id });
+  await assert.rejects(B.ag.pay(B.room, t4.deal_id), /\$2 total/);
+  B.ag.mandate = null; B.ag.policy.ledger.length = 0;
+  console.log("ok mandates: owner-signed, labeled, tamper-proof, bound to agent, seller, price and time; seller can require one; buyer total enforced"); n++;
+
+  // Signature labels: a signature made for one kind of document doesn't verify as another.
+  // Unlabeled (old) signatures still verify during the transition, unless turned off.
+  const ia = await I2.generateAgentIdentity();
+  I2.signatureSettings.signLabeled = true;
+  const lab = await I2.signDoc(ia, { type: "deal", kind: "offer", n: 1 }, "deal");
+  assert.equal(lab.sig_v, 2);
+  assert.ok(await I2.verifyDoc(lab, ia.sign_key, "deal"));
+  assert.ok(!(await I2.verifyDoc(lab, ia.sign_key, "card")), "a deal signature can't pass as a card");
+  assert.ok(!(await I2.verifyDoc(lab, ia.sign_key, "receipt")), "or as a receipt");
+  const { sig_v: _sv, ...stripped } = lab;
+  assert.ok(!(await I2.verifyDoc(stripped, ia.sign_key, "deal")), "removing the label breaks the signature");
+  assert.ok(!(await I2.verifyDoc(lab, ia.sign_key)), "verifying needs a purpose");
+  I2.signatureSettings.signLabeled = false;
+  const old = await I2.signDoc(ia, { type: "deal", kind: "offer", n: 1 }, "deal");
+  assert.equal(old.sig_v, undefined, "phase 1 still signs the old way, so older agents can read it");
+  assert.ok(await I2.verifyDoc(old, ia.sign_key, "deal"));
+  I2.signatureSettings.acceptUnlabeled = false;
+  assert.ok(!(await I2.verifyDoc(old, ia.sign_key, "deal")), "phase 3 refuses old signatures");
+  I2.signatureSettings.acceptUnlabeled = true;
+  // receipts: a labeled buyer and an unlabeled seller still produce one receipt both signatures verify on
+  const AS0 = await import("../src/agents/store.js");
+  const verifyOk = (http) => async (method, path, body) => (path.startsWith("/v1/verify/usdc") ? { ok: true } : http(method, path, body));
+  Sl.ag.http = verifyOk(relayHttp("m_seller"));
+  for (const labeledBuyer of [false, true]) {
+    const tr = await offer();
+    await Sl.ag.accept(Sl.room, tr.deal_id);
+    await B.ag.markPaid(B.room, tr.deal_id, "0x" + (labeledBuyer ? "a1" : "b2").repeat(32), "0x" + "cd".repeat(20));
+    await Sl.ag.deliver(Sl.room, tr.deal_id, "the brief");
+    I2.signatureSettings.signLabeled = labeledBuyer;
+    await B.ag.confirm(B.room, tr.deal_id);
+    I2.signatureSettings.signLabeled = false;
+    const rcpt = await Sl.ag.countersign(Sl.room, tr.deal_id);
+    assert.equal(rcpt.sig_v, labeledBuyer ? 2 : undefined);
+    assert.equal(AS0.receiptShapeError(rcpt), null);
+    const { sigs, ...rb } = rcpt;
+    assert.ok(await I2.verifyDoc({ ...rb, sig: sigs.buyer }, B.ag.id.sign_key, "receipt"), "buyer signature verifies as the server checks it");
+    assert.ok(await I2.verifyDoc({ ...rb, sig: sigs.seller }, Sl.ag.id.sign_key, "receipt"), "seller countersigned the same form");
+  }
+  console.log("ok signature labels: bound to document kind, label can't be stripped, old form accepted until turned off, mixed-version receipts"); n++;
+
   // Abuse cases (owner control and receipts): no model tool can change the owner's limits, and
   // the server refuses receipts carrying fields it doesn't expect.
   const fs = await import("node:fs");
@@ -349,7 +430,7 @@ t("pay-per-room rooms cap at 7 days", () => {
   const tools = [...mcp.matchAll(/registerTool\("([a-z_]+)"/g)].map((m) => m[1]);
   assert.ok(tools.length > 20);
   assert.deepEqual(tools.filter((x) => /polic|limit|admin|approv|setting/.test(x)), [], "no tool edits policy, limits or admin settings");
-  assert.ok(!/writeFileSync\([^)]*POLICY/.test(mcp), "the MCP server never writes the policy file");
+  assert.ok(!/writeFileSync\([^)]*(POLICY|MANDATE)/.test(mcp), "the MCP server never writes the policy or mandate file");
   const AS = await import("../src/agents/store.js");
   const rc = { v: 1, deal_id: "dl_abcdefgh", terms_hash: "h", amount_usd: 1, network: "eip155:8453", buyer: { agent_id: "agt_a", sign_key: "k" }, seller: { agent_id: "agt_b", sign_key: "k", pay_to: PAY_TO }, payment: { tx: "0x1", from: PAY_TO }, delivery_hash: "d", outcome: "completed", sigs: { buyer: "s", seller: "s" } };
   assert.equal(AS.receiptShapeError(rc), null);

@@ -121,7 +121,7 @@ export function validateCard(c) {
 
 // Receipts have one exact shape (the SDK's receiptBody plus sigs). Anything extra is refused,
 // so a signed document of another kind can't be dressed up as a receipt.
-const RECEIPT_KEYS = { top: ["v", "deal_id", "terms_hash", "amount_usd", "network", "buyer", "seller", "payment", "delivery_hash", "outcome", "sigs"],
+const RECEIPT_KEYS = { top: ["v", "deal_id", "terms_hash", "amount_usd", "network", "buyer", "seller", "payment", "delivery_hash", "outcome", "sig_v", "sigs"],
   buyer: ["agent_id", "sign_key"], seller: ["agent_id", "sign_key", "pay_to"], payment: ["tx", "from"], sigs: ["buyer", "seller"] };
 export function receiptShapeError(r) {
   const only = (o, keys, name) => {
@@ -131,7 +131,8 @@ export function receiptShapeError(r) {
   };
   return only(r, RECEIPT_KEYS.top, "receipt") || only(r.buyer, RECEIPT_KEYS.buyer, "buyer") || only(r.seller, RECEIPT_KEYS.seller, "seller") ||
     only(r.payment, RECEIPT_KEYS.payment, "payment") || only(r.sigs, RECEIPT_KEYS.sigs, "sigs") ||
-    (r.delivery_hash != null && !str(r.delivery_hash, 100) ? "delivery_hash must be a string" : null);
+    (r.delivery_hash != null && !str(r.delivery_hash, 100) ? "delivery_hash must be a string" : null) ||
+    (r.sig_v !== undefined && r.sig_v !== 2 ? "sig_v must be 2 when present" : null);
 }
 export function putCard(card) {
   const tomb = tombstones.get(card.agent_id);

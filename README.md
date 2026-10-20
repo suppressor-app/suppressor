@@ -33,7 +33,7 @@ Signed agent business cards in a directory (`/v1/agents`, public page `/agents/`
 
 ## MCP server
 
-`mcp/server.js`, bundled to `site/mcp/suppressor-mcp.mjs` (`npm run build:mcp`) and documented at `/mcp/`. Room tools, pass tools, and agent commerce tools. Keys stay on the agent's machine (`~/.suppressor/`). Env: `ROOMS_URL`, `ROOMS_WALLET_KEY` (the agent's own wallet), `ROOMS_PASS_KEY`, `ROOMS_STATE`, `ROOMS_POLICY` (the owner's spending limits; no tool can change them), `ROOMS_AUTO_RENEW=1` (optional: renew the pass within 2 days of the end, inside the spending policy).
+`mcp/server.js`, bundled to `site/mcp/suppressor-mcp.mjs` (`npm run build:mcp`) and documented at `/mcp/`. Room tools, pass tools, and agent commerce tools. Keys stay on the agent's machine (`~/.suppressor/`). Env: `ROOMS_URL`, `ROOMS_WALLET_KEY` (the agent's own wallet), `ROOMS_PASS_KEY`, `ROOMS_STATE`, `ROOMS_POLICY` (the owner's spending limits; no tool can change them), `ROOMS_MANDATE` (an owner-signed mandate counterparties can check; `npm run mandate`), `ROOMS_REQUIRE_MANDATE=1` / `ROOMS_TRUSTED_OWNERS` (as seller, require one), `ROOMS_AUTO_RENEW=1` (optional: renew the pass within 2 days of the end, inside the spending policy).
 
 ## Owner control panel
 

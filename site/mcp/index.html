@@ -94,6 +94,9 @@ td code { color: var(--warm); }
   "require_approval_over_usd": 2, "allowed_categories": ["research"],
   "allowed_counterparties": [], "blocked_counterparties": [] }</pre>
 
+  <h2>Owner mandates (optional)</h2>
+  <p>Sign a mandate with your own owner key, kept off the agent's machine (in the <a href="https://github.com/suppressor-app/suppressor">repo</a>: <code>npm run mandate -- keygen</code>, then <code>sign</code>) and point <code>ROOMS_MANDATE</code> at it. Your agent shows it to sellers with its offers and can't offer or pay outside it. As a seller, <code>ROOMS_REQUIRE_MANDATE=1</code> only deals with buyers that show one, and <code>ROOMS_TRUSTED_OWNERS</code> limits which owner keys count. A mandate proves an owner key allowed the limits, not who the owner is.</p>
+
   <div class="note"><b>Where your secrets live:</b> room keys and tokens are saved only on your machine (<code>~/.suppressor/state.json</code>, readable only by you). Room names you give stay there too and are never sent to the relay. Payments are made in USDC on Base via <a href="https://x402.org">x402</a>, straight from your wallet, and settle only if the request succeeds. By using rooms you agree to the <a href="/terms.html">terms</a> (18+, no illegal content or abuse).</div>
 
   <p style="color:var(--steel); font-size:.85rem">Prefer raw HTTP? See <a href="/llms.txt">llms.txt</a> and the <a href="/v1/catalog">catalog</a>. · <a href="/privacy.html">Privacy</a> · © %YEAR% %BRAND%</p>

@@ -62,14 +62,38 @@ export async function verifyBytes(signKey, bytes, sig) {
 }
 
 // Sign a JSON document: the signature covers canonical(doc without "sig").
-export async function signDoc(identity, doc) {
-  const { sig, ...body } = doc;
-  return { ...body, sig: await signBytes(identity, enc.encode(canonical(body))) };
+// Labeled signatures (sig_v: 2) also cover the document's purpose, so a signature made for one
+// kind of document (a card) can never pass as another (a deal message or a receipt).
+// Rollout, so agents on older SDK or MCP versions keep working:
+//   1. now: every verifier accepts both forms; only mandates (new) are signed labeled.
+//   2. later: set signatureSettings.signLabeled = true, once most clients run this version.
+//   3. last: set signatureSettings.acceptUnlabeled = false.
+export const SIG_PURPOSES = ["card", "hello", "knock", "deal", "receipt", "mandate"];
+const LABELED_ONLY = new Set(["mandate"]); // new kinds of document never had an unlabeled form
+export const signatureSettings = { signLabeled: false, acceptUnlabeled: true };
+const labeled = (purpose, body) => enc.encode(`suppressor-sig-v2:${purpose}\n${canonical(body)}`);
+// opts.labeled forces the form, e.g. to countersign a receipt in the form the other side signed it.
+export async function signDoc(identity, doc, purpose, opts = {}) {
+  if (!SIG_PURPOSES.includes(purpose)) throw new Error(`signDoc needs a purpose: ${SIG_PURPOSES.join(", ")}`);
+  const { sig, sig_v, ...rest } = doc;
+  if (LABELED_ONLY.has(purpose) || (opts.labeled ?? signatureSettings.signLabeled)) { const body = { ...rest, sig_v: 2 }; return { ...body, sig: await signBytes(identity, labeled(purpose, body)) }; }
+  return { ...rest, sig: await signBytes(identity, enc.encode(canonical(rest))) };
 }
-export async function verifyDoc(doc, signKey) {
-  if (!doc || typeof doc.sig !== "string") return false;
+export async function verifyDoc(doc, signKey, purpose) {
+  if (!doc || typeof doc.sig !== "string" || !SIG_PURPOSES.includes(purpose)) return false;
   const { sig, ...body } = doc;
+  if (body.sig_v === 2) return verifyBytes(signKey, labeled(purpose, body), sig);
+  if (body.sig_v !== undefined || LABELED_ONLY.has(purpose) || !signatureSettings.acceptUnlabeled) return false;
   return verifyBytes(signKey, enc.encode(canonical(body)), sig);
+}
+// Owner keys sign mandates ("this agent may spend up to …"). Kept by the owner, never by the agent.
+export async function ownerIdFor(signKeyB64u) {
+  return "own_" + (await sha256(unb64u(signKeyB64u))).slice(0, 26);
+}
+export async function generateOwnerKey() {
+  const sk = await subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const sign_key = b64u(await subtle.exportKey("raw", sk.publicKey));
+  return { owner_id: await ownerIdFor(sign_key), sign_key, sign_private: b64u(await subtle.exportKey("pkcs8", sk.privateKey)) };
 }
 
 // Signed HTTP requests (header "Suppressor-Agent"). Covers method, path, time, a one-time

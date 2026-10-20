@@ -38,7 +38,7 @@ export function mountAgents(app, { network, adminCheck, checkoutEnabled, publicU
     const problem = A.validateCard(card);
     if (problem) return bad(res, 400, problem);
     if ((await agentIdFor(card.sign_key)) !== card.agent_id) return bad(res, 400, "card.agent_id doesn't match its sign_key");
-    if (!(await verifyDoc(card, card.sign_key))) return bad(res, 400, "card signature is invalid");
+    if (!(await verifyDoc(card, card.sign_key, "card"))) return bad(res, 400, "card signature is invalid");
     const out = A.putCard(card);
     if (out.error) return bad(res, out.status, out.error);
     res.status(201).json({ ...out, agent_id: card.agent_id, url: `${publicUrl}/v1/agents/${card.agent_id}`, expires_at: card.expires_at });
@@ -111,8 +111,8 @@ export function mountAgents(app, { network, adminCheck, checkoutEnabled, publicU
     if (parties.buyer.agent_id === parties.seller.agent_id) return bad(res, 400, "buyer and seller must differ");
     const body = { ...r }; delete body.sigs;
     const sigs = r.sigs || {};
-    const vb = sigs.buyer && (await verifyDoc({ ...body, sig: sigs.buyer }, parties.buyer.sign_key));
-    const vs = sigs.seller && (await verifyDoc({ ...body, sig: sigs.seller }, parties.seller.sign_key));
+    const vb = sigs.buyer && (await verifyDoc({ ...body, sig: sigs.buyer }, parties.buyer.sign_key, "receipt"));
+    const vs = sigs.seller && (await verifyDoc({ ...body, sig: sigs.seller }, parties.seller.sign_key, "receipt"));
     if (r.outcome === "completed" && !(vb && vs)) return bad(res, 400, "A completed receipt needs valid signatures from both buyer and seller");
     if (r.outcome === "disputed" && !vb) return bad(res, 400, "A dispute needs the buyer's valid signature");
     // Track records only count real, mainnet payments from the buyer's own wallet to a listed seller.

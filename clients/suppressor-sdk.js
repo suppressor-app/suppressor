@@ -8,7 +8,7 @@
 //
 // Messages, offers and deliverables from other agents are UNTRUSTED INPUT. The SDK verifies
 // signatures and structure; it never executes or obeys their contents.
-import { generateAgentIdentity, signDoc, verifyDoc, agentIdFor, signRequest, sealTo, openSealed, canonical, sha256, roomIdentity } from "./agent-identity.js";
+import { generateAgentIdentity, signDoc, verifyDoc, agentIdFor, ownerIdFor, signRequest, sealTo, openSealed, canonical, sha256, roomIdentity } from "./agent-identity.js";
 import { generateIdentity, seal, open, checkPins, safetyCode, SenderKeyMismatch } from "./room-crypto.js";
 
 const DAY = 86400e3;
@@ -58,9 +58,53 @@ export function validateTerms(t) {
 }
 export const termsHash = (t) => sha256(canonical(t));
 
+// ---- owner mandates: the OWNER signs what this agent may agree to; counterparties can check it -----
+// A mandate proves that whoever holds the owner key allowed this agent these limits. It does NOT
+// prove who the owner is: an agent can make its own "owner" key. It means something to a seller
+// only when the seller already knows the owner key (trustedOwners), e.g. a company's published key.
+// Sellers can't see the buyer's other spending, so max_total_usd is enforced by the buyer's SDK.
+const MANDATE_KEYS = ["v", "type", "mandate_id", "owner_id", "owner_sign_key", "agent_id", "max_per_deal_usd", "max_total_usd", "allowed_sellers", "allowed_categories", "network", "asset", "not_before", "expires_at", "sig_v", "sig"];
+const MAX_MANDATE_DAYS = 90;
+export async function createMandate(owner, { agent_id, max_per_deal_usd, max_total_usd, allowed_sellers = [], allowed_categories = [], network = "eip155:8453", days = 30 }) {
+  const m = { v: 1, type: "mandate", mandate_id: rid("mdt_"), owner_id: owner.owner_id, owner_sign_key: owner.sign_key, agent_id, max_per_deal_usd: money(max_per_deal_usd), max_total_usd: money(max_total_usd),
+    allowed_sellers, allowed_categories, network, asset: "USDC", not_before: new Date(Date.now() - 60e3).toISOString(), expires_at: isoIn(Math.min(days, MAX_MANDATE_DAYS) * DAY) };
+  const bad = mandateShapeError(m); if (bad) throw new Error("Bad mandate: " + bad);
+  return signDoc(owner, m, "mandate");
+}
+function mandateShapeError(m) {
+  if (!m || typeof m !== "object" || Array.isArray(m)) return "mandate missing";
+  for (const k of Object.keys(m)) if (!MANDATE_KEYS.includes(k)) return `unknown mandate field "${k}"`;
+  if (m.v !== 1 || m.type !== "mandate" || !/^mdt_[a-z0-9]{8,20}$/.test(m.mandate_id || "")) return "not a v1 mandate";
+  if (!/^own_[A-Za-z0-9_-]{26}$/.test(m.owner_id || "") || !/^[A-Za-z0-9_-]{43}$/.test(m.owner_sign_key || "")) return "owner_id and owner_sign_key required";
+  if (!/^agt_[A-Za-z0-9_-]{26}$/.test(m.agent_id || "")) return "agent_id malformed";
+  for (const k of ["max_per_deal_usd", "max_total_usd"]) if (!(typeof m[k] === "number" && m[k] > 0 && m[k] <= 100000 && money(m[k]) === m[k])) return `${k} must be > 0`;
+  if (m.max_per_deal_usd > m.max_total_usd) return "max_per_deal_usd is over max_total_usd";
+  for (const k of ["allowed_sellers", "allowed_categories"]) if (!(Array.isArray(m[k]) && m[k].length <= 50 && m[k].every((x) => typeof x === "string" && x.length <= 100))) return `${k} must be a list`;
+  if (m.asset !== "USDC" || !/^eip155:\d+$/.test(m.network || "")) return "asset must be USDC on an eip155 network";
+  const nb = Date.parse(m.not_before), ex = Date.parse(m.expires_at);
+  if (!(nb > 0 && ex > nb && ex - nb <= MAX_MANDATE_DAYS * DAY + 120e3)) return `not_before/expires_at must span ≤ ${MAX_MANDATE_DAYS} days`;
+  return null;
+}
+// -> null if the mandate covers these terms, else the reason. trustedOwners: owner ids you accept (empty = any key).
+export async function checkMandate(m, { agent_id, terms, category, trustedOwners = [], now = Date.now() } = {}) {
+  const bad = mandateShapeError(m); if (bad) return bad;
+  if ((await ownerIdFor(m.owner_sign_key)) !== m.owner_id) return "owner_id doesn't match owner_sign_key";
+  if (!(await verifyDoc(m, m.owner_sign_key, "mandate"))) return "owner signature is invalid";
+  if (trustedOwners.length && !trustedOwners.includes(m.owner_id)) return "mandate is from an owner you don't trust";
+  if (agent_id && m.agent_id !== agent_id) return "mandate is for a different agent";
+  if (now < Date.parse(m.not_before) || now >= Date.parse(m.expires_at)) return "mandate isn't valid now";
+  if (terms) {
+    if (terms.network !== m.network || terms.asset !== m.asset) return "terms are on a network or asset the mandate doesn't allow";
+    if (terms.price_usd > m.max_per_deal_usd) return `$${terms.price_usd} is over the mandate's $${m.max_per_deal_usd} per deal`;
+    if (m.allowed_sellers.length && !m.allowed_sellers.includes(terms.seller)) return "seller isn't allowed by the mandate";
+  }
+  if (category != null && m.allowed_categories.length && !m.allowed_categories.includes(category)) return `category "${category}" isn't allowed by the mandate`;
+  return null;
+}
+
 // Deal state from a room's verified history. Statuses: proposed -> agreed -> paid -> delivered -> completed | disputed (or rejected/expired/withdrawn).
 function reduceDeal(msgs) {
-  const d = { deal_id: msgs[0].deal_id, status: "proposed", terms: null, terms_hash: null, offer_by: null, signatures: {}, payment: null, delivery: null, receipt: null, history: [] };
+  const d = { deal_id: msgs[0].deal_id, status: "proposed", terms: null, terms_hash: null, offer_by: null, signatures: {}, mandate: null, payment: null, delivery: null, receipt: null, history: [] };
   for (const m of msgs) {
     d.history.push({ kind: m.kind, by: m.agent_id, at: m.ts });
     const party = d.terms ? [d.terms.buyer, d.terms.seller].includes(m.agent_id) : true;
@@ -68,8 +112,11 @@ function reduceDeal(msgs) {
       // Once both sides agreed, the terms are locked: later offers can't reopen the deal.
       if (["agreed", "paid", "delivered", "completed", "disputed"].includes(d.status)) continue;
       d.terms = m.terms; d.terms_hash = m.terms_hash; d.offer_by = m.agent_id; d.signatures = { [m.agent_id]: m.sig }; d.status = "proposed";
+      // The buyer's owner mandate rides on its offer, counter or accept (checked by checkMandate, not here).
+      if (m.agent_id === d.terms.buyer) d.mandate = m.mandate || null;
     } else if (m.kind === "accept" && party && d.status === "proposed" && m.terms_hash === d.terms_hash && m.agent_id !== d.offer_by && Date.parse(d.terms.offer_expires_at) > Date.parse(m.ts)) {
       d.signatures[m.agent_id] = m.sig; d.status = "agreed";
+      if (m.agent_id === d.terms.buyer && m.mandate) d.mandate = m.mandate;
     } else if (m.kind === "reject" && party && d.status === "proposed" && m.agent_id !== d.offer_by) d.status = "rejected";
     else if (m.kind === "withdraw" && d.status === "proposed" && m.agent_id === d.offer_by) d.status = "withdrawn";
     else if (m.kind === "paid" && d.status === "agreed" && m.agent_id === d.terms.buyer) { d.payment = m.payment; d.status = "paid"; }
@@ -85,8 +132,12 @@ export class SuppressorAgent {
   // payTo: this agent's own receiving address when it sells (defaults to its published card).
   // networks: networks this agent will deal on. usedTx: tx -> deal_id it has already accepted as payment
   // (pass a persisted Map to remember across restarts).
-  constructor({ baseUrl, identity, fetch: f = globalThis.fetch, payFetch = null, policy = new SpendingPolicy(), approve = null, passKey = null, payTo = null, networks = ["eip155:8453"], usedTx = new Map() }) {
+  // mandate: a signed owner mandate for this agent, attached to its offers as buyer and enforced on its payments.
+  // requireMandate / trustedOwners: as seller, only agree to and deliver deals whose buyer shows a valid
+  // mandate (from one of these owner ids, if any are listed).
+  constructor({ baseUrl, identity, fetch: f = globalThis.fetch, payFetch = null, policy = new SpendingPolicy(), approve = null, passKey = null, payTo = null, networks = ["eip155:8453"], usedTx = new Map(), mandate = null, requireMandate = false, trustedOwners = [] }) {
     this.payTo = payTo; this.networks = networks; this.usedTx = usedTx; this.paying = new Set();
+    this.mandate = mandate; this.requireMandate = requireMandate || trustedOwners.length > 0; this.trustedOwners = trustedOwners;
     this.base = baseUrl.replace(/\/$/, "");
     this.id = identity;
     this.f = f.bind ? f.bind(globalThis) : f;
@@ -115,12 +166,12 @@ export class SuppressorAgent {
 
   // ---- DISCOVER / VERIFY -------------------------------------------------------------------
   async makeCard({ name, description, tags, services = [], protocols = ["suppressor/1.2", "x402", "mcp"], payment, endpoints, days = 30 }) {
-    return signDoc(this.id, { v: 1, agent_id: this.id.agent_id, sign_key: this.id.sign_key, box_key: this.id.box_key, name, description, tags, services, protocols, payment, endpoints, issued_at: new Date().toISOString(), expires_at: isoIn(Math.min(30, days) * DAY - 60e3) });
+    return signDoc(this.id, { v: 1, agent_id: this.id.agent_id, sign_key: this.id.sign_key, box_key: this.id.box_key, name, description, tags, services, protocols, payment, endpoints, issued_at: new Date().toISOString(), expires_at: isoIn(Math.min(30, days) * DAY - 60e3) }, "card");
   }
   async publish(fields) { this.card = await this.makeCard(fields); return this.http("POST", "/v1/agents", { card: this.card }); }
   unpublish() { return this.http("DELETE", `/v1/agents/${this.agentId}`, null, { signed: true }); }
   // Verify a listing ourselves: the card must be signed by the key its agent_id is derived from.
-  static async verifyListing(l) { return !!(l?.card && (await agentIdFor(l.card.sign_key)) === l.card.agent_id && l.agent_id === l.card.agent_id && (await verifyDoc(l.card, l.card.sign_key))); }
+  static async verifyListing(l) { return !!(l?.card && (await agentIdFor(l.card.sign_key)) === l.card.agent_id && l.agent_id === l.card.agent_id && (await verifyDoc(l.card, l.card.sign_key, "card"))); }
   async search(params = {}) {
     const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v != null && v !== "")).toString();
     const r = await this.http("GET", "/v1/agents" + (qs ? "?" + qs : ""));
@@ -153,7 +204,7 @@ export class SuppressorAgent {
   // Ask a listed agent to talk: seal the invite to its box key and drop it in its inbox.
   async knock(agentId, room, { note = "", label } = {}) {
     const l = await this.lookup(agentId);
-    const inner = await signDoc(this.id, { type: "knock", from: this.agentId, from_sign_key: this.id.sign_key, to: agentId, invite_code: room.invite_code, label, note: String(note).slice(0, 1000), ts: new Date().toISOString() });
+    const inner = await signDoc(this.id, { type: "knock", from: this.agentId, from_sign_key: this.id.sign_key, to: agentId, invite_code: room.invite_code, label, note: String(note).slice(0, 1000), ts: new Date().toISOString() }, "knock");
     await this.http("POST", `/v1/agents/${agentId}/knock`, { sealed: await sealTo(l.card.box_key, agentId, JSON.stringify(inner)) });
     await this.hello(room);
   }
@@ -164,7 +215,7 @@ export class SuppressorAgent {
     for (const k of r.knocks) {
       try {
         const inner = JSON.parse(await openSealed(this.id, k.sealed));
-        const verified = inner.to === this.agentId && (await agentIdFor(inner.from_sign_key)) === inner.from && (await verifyDoc(inner, inner.from_sign_key));
+        const verified = inner.to === this.agentId && (await agentIdFor(inner.from_sign_key)) === inner.from && (await verifyDoc(inner, inner.from_sign_key, "knock"));
         out.push({ knock_id: k.knock_id, received_at: k.received_at, from: verified ? inner.from : null, verified, invite_code: typeof inner.invite_code === "string" ? inner.invite_code : null, label: inner.label, note: inner.note, untrusted: true });
       } catch { out.push({ knock_id: k.knock_id, error: "could not open" }); }
     }
@@ -195,7 +246,7 @@ export class SuppressorAgent {
   }
   // Bind my agent identity to my room seat, signed, so peers know who they're dealing with.
   async hello(room) {
-    room.pendingHello = await signDoc(this.id, { type: "hello", agent_id: this.agentId, sign_key: this.id.sign_key, room_id: room.room_id, member_id: room.member_id });
+    room.pendingHello = await signDoc(this.id, { type: "hello", agent_id: this.agentId, sign_key: this.id.sign_key, room_id: room.room_id, member_id: room.member_id }, "hello");
     try { await this.post(room, room.pendingHello); room.pendingHello = null; } catch (e) { if (!/public key|joined/i.test(e.message)) throw e; }
   }
   // wait: hold the request open up to N seconds (max 30) until something new arrives.
@@ -212,10 +263,10 @@ export class SuppressorAgent {
       if (plain == null) continue;
       let j; try { j = JSON.parse(plain); } catch { j = { type: "text", text: plain }; }
       const entry = { seq: m.seq, from_member: m.from, at: m.at, msg: j, verified_agent: null };
-      if (j.type === "hello" && j.room_id === room.room_id && j.member_id === m.from && (await agentIdFor(j.sign_key)) === j.agent_id && (await verifyDoc(j, j.sign_key)))
+      if (j.type === "hello" && j.room_id === room.room_id && j.member_id === m.from && (await agentIdFor(j.sign_key)) === j.agent_id && (await verifyDoc(j, j.sign_key, "hello")))
         this.verifiedPeers.set(`${room.room_id}:${m.from}`, { agent_id: j.agent_id, sign_key: j.sign_key });
       const peer = this.verifiedPeers.get(`${room.room_id}:${m.from}`) || (m.from === room.member_id ? { agent_id: this.agentId, sign_key: this.id.sign_key } : null);
-      if (j.type === "deal") entry.verified_agent = peer && peer.agent_id === j.agent_id && (await verifyDoc(j, peer.sign_key)) ? j.agent_id : null;
+      if (j.type === "deal") entry.verified_agent = peer && peer.agent_id === j.agent_id && (await verifyDoc(j, peer.sign_key, "deal")) ? j.agent_id : null;
       room.log.push(entry);
     }
     room.last = r.last_seq;
@@ -224,7 +275,7 @@ export class SuppressorAgent {
 
   // ---- NEGOTIATE ------------------------------------------------------------------------------
   async dealMsg(room, kind, fields) {
-    const m = await signDoc(this.id, { type: "deal", kind, agent_id: this.agentId, ts: new Date().toISOString(), ...fields });
+    const m = await signDoc(this.id, { type: "deal", kind, agent_id: this.agentId, ts: new Date().toISOString(), ...fields }, "deal");
     await this.post(room, m);
     return m;
   }
@@ -232,7 +283,7 @@ export class SuppressorAgent {
     const terms = { deal_id: deal_id || rid("dl_"), version: 1, buyer, seller, service, category, deliverable, price_usd: money(price_usd), network, asset: "USDC", pay_to, deadline, offer_expires_at: isoIn(expires_minutes * 60e3) };
     const bad = validateTerms(terms); if (bad) throw new Error("Bad terms: " + bad);
     if (![buyer, seller].includes(this.agentId)) throw new Error("You must be the buyer or the seller.");
-    await this.dealMsg(room, "offer", { deal_id: terms.deal_id, terms, terms_hash: await termsHash(terms) });
+    await this.dealMsg(room, "offer", { deal_id: terms.deal_id, terms, terms_hash: await termsHash(terms), ...(await this.myMandateFor(terms)) });
     return terms;
   }
   async counter(room, deal_id, changes, expires_minutes = 60) {
@@ -241,7 +292,7 @@ export class SuppressorAgent {
     const terms = { ...d.terms, ...changes, deal_id, version: d.terms.version + 1, buyer: d.terms.buyer, seller: d.terms.seller, offer_expires_at: isoIn(expires_minutes * 60e3) };
     if (changes.price_usd != null) terms.price_usd = money(changes.price_usd);
     const bad = validateTerms(terms); if (bad) throw new Error("Bad terms: " + bad);
-    await this.dealMsg(room, "counter", { deal_id, terms, terms_hash: await termsHash(terms) });
+    await this.dealMsg(room, "counter", { deal_id, terms, terms_hash: await termsHash(terms), ...(await this.myMandateFor(terms)) });
     return terms;
   }
   async myPayTo() {
@@ -258,13 +309,28 @@ export class SuppressorAgent {
       if (String(t.pay_to).toLowerCase() !== mine.toLowerCase()) throw new Error("Refusing terms: pay_to isn't your receiving address.");
     }
   }
+  // As buyer: my mandate, to attach to an offer. Refuses terms my own mandate doesn't cover.
+  async myMandateFor(terms) {
+    if (!this.mandate || terms.buyer !== this.agentId) return {};
+    const bad = await checkMandate(this.mandate, { agent_id: this.agentId, terms });
+    if (bad) throw new Error("Your owner's mandate doesn't cover these terms: " + bad);
+    return { mandate: this.mandate };
+  }
+  // As seller with requireMandate: the buyer must show a valid mandate covering the agreed terms.
+  async checkBuyerMandate(d) {
+    if (!this.requireMandate || d.terms.seller !== this.agentId) return;
+    if (!d.mandate) throw new Error("The buyer hasn't shown an owner mandate, and this agent requires one.");
+    const bad = await checkMandate(d.mandate, { agent_id: d.terms.buyer, terms: d.terms, trustedOwners: this.trustedOwners });
+    if (bad) throw new Error("Buyer's mandate refused: " + bad);
+  }
   async accept(room, deal_id) {
     const d = await this.deal(room, deal_id);
     if (d.status !== "proposed" || d.offer_by === this.agentId) throw new Error("Nothing from the other side to accept.");
     if (![d.terms.buyer, d.terms.seller].includes(this.agentId)) throw new Error("You aren't the buyer or the seller in this deal.");
     if (validateTerms(d.terms)) throw new Error("Refusing malformed terms.");
     await this.checkTermsForMe(d.terms);
-    return this.dealMsg(room, "accept", { deal_id, terms_hash: d.terms_hash });
+    await this.checkBuyerMandate(d);
+    return this.dealMsg(room, "accept", { deal_id, terms_hash: d.terms_hash, ...(await this.myMandateFor(d.terms)) });
   }
   reject(room, deal_id, reason = "") { return this.dealMsg(room, "reject", { deal_id, reason: String(reason).slice(0, 500) }); }
   withdraw(room, deal_id) { return this.dealMsg(room, "withdraw", { deal_id }); }
@@ -299,6 +365,12 @@ export class SuppressorAgent {
     // Category comes from the seller's own signed listing, not from terms the counterparty wrote.
     let category;
     try { const l = await this.http("GET", `/v1/agents/${d.terms.seller}`); category = l?.card?.services?.find((s) => s.id === d.terms.service)?.category; } catch {}
+    if (this.mandate) {
+      const bad = await checkMandate(this.mandate, { agent_id: this.agentId, terms: d.terms, category });
+      if (bad) throw new Error("Blocked by your owner's mandate: " + bad);
+      const used = money(this.policy.ledger.filter((e) => e.mandate_id === this.mandate.mandate_id).reduce((a, e) => a + e.usd, 0));
+      if (used + usd > this.mandate.max_total_usd) throw new Error(`Blocked by your owner's mandate: would pass its $${this.mandate.max_total_usd} total ($${used} used).`);
+    }
     const verdict = this.policy.check({ usd, counterparty: d.terms.seller, category });
     if (verdict.decision === "deny") throw Object.assign(new Error("Blocked by spending policy: " + verdict.reason), { policy: verdict });
     if (verdict.decision === "approve" && !(this.approve && (await this.approve({ usd, counterparty: d.terms.seller, deal: d.terms, reason: verdict.reason }))))
@@ -311,7 +383,7 @@ export class SuppressorAgent {
       const r = await this.http("POST", `/v1/checkouts/${co.checkout_id}/pay`, {}, { pay: true });
       const tx = r._settlement?.transaction;
       if (!tx) throw new Error("Payment didn't settle; nothing was recorded as paid.");
-      this.policy.record({ usd, to_agent: d.terms.seller, deal_id });
+      this.policy.record({ usd, to_agent: d.terms.seller, deal_id, mandate_id: this.mandate?.mandate_id });
       await this.dealMsg(room, "paid", { deal_id, terms_hash: d.terms_hash, payment: { tx, from: r._settlement?.payer, checkout_id: co.checkout_id, network: d.terms.network } });
       return { tx, checkout_id: co.checkout_id };
     } finally { this.paying.delete(deal_id); }
@@ -339,6 +411,7 @@ export class SuppressorAgent {
     const d = await this.deal(room, deal_id);
     if (d.status !== "paid" || d.terms.seller !== this.agentId) throw new Error(`Only the seller can deliver a paid deal (it is ${d.status}).`);
     await this.checkTermsForMe(d.terms); // money really goes to my address, on an allowed network
+    await this.checkBuyerMandate(d);
     const v = await this.verifyPayment(room, deal_id);
     if (!v.ok) throw new Error("Payment not verified on-chain yet: " + v.error);
     this.usedTx.set(String(d.payment.tx).toLowerCase(), deal_id);
@@ -357,9 +430,8 @@ export class SuppressorAgent {
     const d = await this.deal(room, deal_id);
     if (d.status !== "delivered" || d.terms.buyer !== this.agentId) throw new Error(`Only the buyer can confirm a delivered deal (it is ${d.status}).`);
     if ((await sha256(d.delivery.content)) !== d.delivery.sha256) outcome = "disputed";
-    const body = this.receiptBody(d, outcome);
-    const signed = await signDoc(this.id, body);
-    await this.dealMsg(room, "confirm", { deal_id, receipt: { ...body, sigs: { buyer: signed.sig } }, reason: reason ? String(reason).slice(0, 500) : undefined });
+    const { sig, ...body } = await signDoc(this.id, this.receiptBody(d, outcome), "receipt");
+    await this.dealMsg(room, "confirm", { deal_id, receipt: { ...body, sigs: { buyer: sig } }, reason: reason ? String(reason).slice(0, 500) : undefined });
     return { outcome };
   }
   // Seller: countersign the buyer's receipt (completed deals need both signatures).
@@ -367,8 +439,9 @@ export class SuppressorAgent {
     const d = await this.deal(room, deal_id);
     if (!d.receipt || d.terms.seller !== this.agentId) throw new Error("No receipt to countersign.");
     const { sigs, ...body } = d.receipt;
-    if (canonical(body) !== canonical(this.receiptBody(d, body.outcome))) throw new Error("Receipt doesn't match the deal.");
-    const signed = await signDoc(this.id, body);
+    const { sig_v, ...plain } = body;
+    if (canonical(plain) !== canonical(this.receiptBody(d, body.outcome))) throw new Error("Receipt doesn't match the deal.");
+    const signed = await signDoc(this.id, body, "receipt", { labeled: sig_v === 2 }); // same form the buyer signed
     await this.dealMsg(room, "countersign", { deal_id, receipt_sig: signed.sig });
     return { ...body, sigs: { ...sigs, seller: signed.sig } };
   }
