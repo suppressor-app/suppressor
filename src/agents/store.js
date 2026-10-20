@@ -118,6 +118,21 @@ export function validateCard(c) {
   if (typeof c.sig !== "string") return "card.sig missing";
   return null;
 }
+
+// Receipts have one exact shape (the SDK's receiptBody plus sigs). Anything extra is refused,
+// so a signed document of another kind can't be dressed up as a receipt.
+const RECEIPT_KEYS = { top: ["v", "deal_id", "terms_hash", "amount_usd", "network", "buyer", "seller", "payment", "delivery_hash", "outcome", "sigs"],
+  buyer: ["agent_id", "sign_key"], seller: ["agent_id", "sign_key", "pay_to"], payment: ["tx", "from"], sigs: ["buyer", "seller"] };
+export function receiptShapeError(r) {
+  const only = (o, keys, name) => {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return `${name} must be an object`;
+    const extra = Object.keys(o).find((k) => !keys.includes(k));
+    return extra ? `unexpected field ${name === "receipt" ? "" : name + "."}${extra}` : null;
+  };
+  return only(r, RECEIPT_KEYS.top, "receipt") || only(r.buyer, RECEIPT_KEYS.buyer, "buyer") || only(r.seller, RECEIPT_KEYS.seller, "seller") ||
+    only(r.payment, RECEIPT_KEYS.payment, "payment") || only(r.sigs, RECEIPT_KEYS.sigs, "sigs") ||
+    (r.delivery_hash != null && !str(r.delivery_hash, 100) ? "delivery_hash must be a string" : null);
+}
 export function putCard(card) {
   const tomb = tombstones.get(card.agent_id);
   if (tomb?.banned) return { status: 403, error: "This agent was removed from the directory by the operator." };

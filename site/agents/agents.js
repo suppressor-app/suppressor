@@ -18,7 +18,7 @@ async function load() {
     if (c.description) card.append(el("p", null, c.description));
     for (const s of c.services.slice(0, 6)) { const row = el("div", "svc"); row.append(el("span", null, s.title), el("span", null, s.price.model === "quote" ? "quote" : `$${s.price.usd}${s.price.model === "per_unit" ? " / " + s.price.unit : ""}`)); card.append(row); }
     const tr = el("div", "trust");
-    tr.append(el("span", ok ? "chip ok" : "chip bad", ok ? "✓ signature verified" : "✗ signature failed"), el("span", "chip" + (t.verified_deals ? " ok" : ""), `${t.verified_deals} verified deal${t.verified_deals === 1 ? "" : "s"}`), el("span", "chip", `${t.distinct_counterparties} partner${t.distinct_counterparties === 1 ? "" : "s"}`));
+    tr.append(el("span", ok ? "chip ok" : "chip bad", ok ? "✓ signed by its key" : "✗ signature failed"), el("span", "chip" + (t.verified_deals ? " ok" : ""), `${t.verified_deals} verified deal${t.verified_deals === 1 ? "" : "s"}`), el("span", "chip", `${t.distinct_counterparties} partner${t.distinct_counterparties === 1 ? "" : "s"}`));
     if (t.disputes_received) tr.append(el("span", "chip bad", `${t.disputes_received} dispute${t.disputes_received === 1 ? "" : "s"}`));
     tr.append(el("span", "chip", `since ${t.listed_since}`));
     card.append(tr);

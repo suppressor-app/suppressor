@@ -282,4 +282,81 @@ t("pay-per-room rooms cap at 7 days", () => {
   console.log("ok agent deals: seller checks pay_to and network, payer bound, no payment reuse, no double pay"); n++;
 }
 
+{
+  // Abuse cases (negotiation): three agents in one in-memory relay room. Each attack is a validly
+  // signed message the SDK must refuse to count. The relay stores ciphertext, like the real one.
+  const { SuppressorAgent } = await import("../clients/suppressor-sdk.js");
+  const { signDoc, roomIdentity } = await import("../clients/agent-identity.js");
+  const relay = { members: [], msgs: [] };
+  const relayHttp = (member_id) => async (method, path, body) => {
+    if (method === "GET" && /^\/v1\/rooms\/[^/]+$/.test(path)) return { members: relay.members };
+    if (method === "POST" && path.endsWith("/messages")) { relay.msgs.push({ seq: relay.msgs.length + 1, from: member_id, at: new Date().toISOString(), body: body.body }); return {}; }
+    if (method === "GET" && path.includes("/messages")) { const after = Number(/after=(\d+)/.exec(path)[1]); return { messages: relay.msgs.filter((m) => m.seq > after), last_seq: relay.msgs.length }; }
+    throw Object.assign(new Error("not found"), { status: 404 });
+  };
+  const PAY_TO = "0x" + "ab".repeat(20);
+  const join = async (member_id, opts = {}) => {
+    const ag = await SuppressorAgent.create({ baseUrl: "http://relay", ...opts });
+    ag.http = relayHttp(member_id);
+    const room = { room_id: "rm_abuse", member_id, token: member_id, last: 0, me: roomIdentity(ag.id) };
+    relay.members.push({ member_id, public_key: room.me.publicKey });
+    return { ag, room };
+  };
+  const B = await join("m_buyer"), Sl = await join("m_seller", { payTo: PAY_TO }), M = await join("m_mallory");
+  for (const x of [B, Sl, M]) await x.ag.hello(x.room);
+  const offer = (extra = {}) => B.ag.propose(B.room, { buyer: B.ag.agentId, seller: Sl.ag.agentId, service: "brief", deliverable: "1-page brief", price_usd: 1, pay_to: PAY_TO, ...extra });
+  const status = async (id) => (await B.ag.deal(B.room, id)).status;
+
+  // a stranger in the room can't accept, and can't speak for the seller
+  const t1 = await offer();
+  await M.ag.dealMsg(M.room, "accept", { deal_id: t1.deal_id, terms_hash: (await B.ag.deal(B.room, t1.deal_id)).terms_hash });
+  await M.ag.post(M.room, await signDoc(M.ag.id, { type: "deal", kind: "accept", agent_id: Sl.ag.agentId, ts: new Date().toISOString(), deal_id: t1.deal_id, terms_hash: (await B.ag.deal(B.room, t1.deal_id)).terms_hash }));
+  assert.equal(await status(t1.deal_id), "proposed", "accept from a non-party or an impostor doesn't count");
+  // an accept of stale terms doesn't count
+  const stale = (await B.ag.deal(B.room, t1.deal_id)).terms_hash;
+  await Sl.ag.counter(Sl.room, t1.deal_id, { price_usd: 2 });
+  await Sl.ag.dealMsg(Sl.room, "accept", { deal_id: t1.deal_id, terms_hash: stale });
+  await B.ag.dealMsg(B.room, "accept", { deal_id: t1.deal_id, terms_hash: stale });
+  assert.equal(await status(t1.deal_id), "proposed", "accepting superseded terms doesn't agree the deal");
+  // once agreed, terms are locked: a later counter can't raise the price
+  await B.ag.accept(B.room, t1.deal_id);
+  assert.equal(await status(t1.deal_id), "agreed");
+  await Sl.ag.dealMsg(Sl.room, "counter", { deal_id: t1.deal_id, terms: { ...t1, version: 9, price_usd: 50 }, terms_hash: "x" });
+  await Sl.ag.counter(Sl.room, t1.deal_id, { price_usd: 50 }).catch(() => {});
+  const d1 = await B.ag.deal(B.room, t1.deal_id);
+  assert.equal(d1.status, "agreed"); assert.equal(d1.terms.price_usd, 2, "agreed price can't be changed by one side");
+  // only the buyer can report payment
+  await Sl.ag.dealMsg(Sl.room, "paid", { deal_id: t1.deal_id, terms_hash: d1.terms_hash, payment: { tx: "0x" + "11".repeat(32), from: "0x" + "22".repeat(20), network: "eip155:8453" } });
+  assert.equal(await status(t1.deal_id), "agreed", "a payment reported by the seller doesn't count");
+  // an offer whose terms_hash doesn't match its terms is dropped
+  await B.ag.dealMsg(B.room, "offer", { deal_id: "dl_tampered01", terms: { ...t1, deal_id: "dl_tampered01" }, terms_hash: stale });
+  assert.equal((await B.ag.deals(B.room)).some((d) => d.deal_id === "dl_tampered01"), false, "tampered offer ignored");
+  // an accept after the offer expired doesn't count
+  const t2 = await offer({ expires_minutes: 0.0005 });
+  await new Promise((r) => setTimeout(r, 80));
+  await Sl.ag.dealMsg(Sl.room, "accept", { deal_id: t2.deal_id, terms_hash: (await B.ag.deal(B.room, t2.deal_id)).terms_hash });
+  assert.equal(await status(t2.deal_id), "expired", "late accept doesn't agree an expired offer");
+  // a relay that tampers with ciphertext gets the message hidden, not believed
+  const last = relay.msgs[relay.msgs.length - 1];
+  relay.msgs.push({ ...last, seq: relay.msgs.length + 1, from: "m_seller", body: last.body.slice(0, -8) + "AAAAAAAA" });
+  assert.equal(await status(t2.deal_id), "expired", "tampered ciphertext is dropped, not believed");
+  console.log("ok abuse cases: impostor and non-party accepts, stale accepts, locked terms, seller-reported payment, tampered and late messages"); n++;
+
+  // Abuse cases (owner control and receipts): no model tool can change the owner's limits, and
+  // the server refuses receipts carrying fields it doesn't expect.
+  const fs = await import("node:fs");
+  const mcp = fs.readFileSync(new URL("../mcp/server.js", import.meta.url), "utf8");
+  const tools = [...mcp.matchAll(/registerTool\("([a-z_]+)"/g)].map((m) => m[1]);
+  assert.ok(tools.length > 20);
+  assert.deepEqual(tools.filter((x) => /polic|limit|admin|approv|setting/.test(x)), [], "no tool edits policy, limits or admin settings");
+  assert.ok(!/writeFileSync\([^)]*POLICY/.test(mcp), "the MCP server never writes the policy file");
+  const AS = await import("../src/agents/store.js");
+  const rc = { v: 1, deal_id: "dl_abcdefgh", terms_hash: "h", amount_usd: 1, network: "eip155:8453", buyer: { agent_id: "agt_a", sign_key: "k" }, seller: { agent_id: "agt_b", sign_key: "k", pay_to: PAY_TO }, payment: { tx: "0x1", from: PAY_TO }, delivery_hash: "d", outcome: "completed", sigs: { buyer: "s", seller: "s" } };
+  assert.equal(AS.receiptShapeError(rc), null);
+  assert.match(AS.receiptShapeError({ ...rc, type: "deal" }), /unexpected field type/);
+  assert.match(AS.receiptShapeError({ ...rc, seller: { ...rc.seller, note: "x" } }), /seller\.note/);
+  assert.match(AS.receiptShapeError({ ...rc, payment: null }), /payment must be an object/);
+  console.log("ok abuse cases: no tool can change owner limits, receipts with unexpected fields refused"); n++;
+}
+
 console.log(`\n${n} checks passed`);

@@ -98,6 +98,8 @@ export function mountAgents(app, { network, adminCheck, checkoutEnabled, publicU
   app.post("/v1/receipts", perIp("rcpt", 30, 3600e3), async (req, res) => {
     const r = req.body?.receipt;
     if (!r || r.v !== 1 || typeof r.deal_id !== "string" || typeof r.terms_hash !== "string") return bad(res, 400, "receipt must be {v:1, deal_id, terms_hash, amount_usd, network, buyer, seller, payment:{tx}, delivery_hash?, outcome, sigs}");
+    const shape = A.receiptShapeError(r);
+    if (shape) return bad(res, 400, "receipt: " + shape);
     if (!["completed", "disputed"].includes(r.outcome)) return bad(res, 400, "outcome must be completed or disputed");
     if (!(typeof r.amount_usd === "number" && r.amount_usd > 0 && r.amount_usd <= 1e6)) return bad(res, 400, "amount_usd must be > 0");
     const parties = {};
