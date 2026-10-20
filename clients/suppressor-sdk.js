@@ -19,7 +19,7 @@ const money = (n) => Math.round(Number(n) * 1e6) / 1e6;
 // ---- spending policy: enforced in code, set by the OWNER (not by the agent) -------------------
 export class SpendingPolicy {
   constructor(p = {}, ledger = []) {
-    this.p = { max_per_payment_usd: 5, max_per_day_usd: 20, max_total_usd: 100, require_approval_over_usd: 2, allowed_categories: [], allowed_counterparties: [], blocked_counterparties: [], ...p };
+    this.p = { max_per_payment_usd: 5, max_per_day_usd: 20, max_total_usd: 100, require_approval_over_usd: 2, allowed_categories: [], allowed_counterparties: [], blocked_counterparties: [], escrow_at_or_over_usd: 100, escrow_below_verified_deals: 0, escrow_counterparties: [], ...p };
     this.ledger = ledger; // [{ at, usd, to_agent, deal_id }]
   }
   spent(sinceMs) { const t = Date.now(); return money(this.ledger.filter((e) => sinceMs == null || t - Date.parse(e.at) < sinceMs).reduce((a, e) => a + e.usd, 0)); }
@@ -36,11 +36,21 @@ export class SpendingPolicy {
     if (usd > p.require_approval_over_usd) return { decision: "approve", reason: `$${usd} is over $${p.require_approval_over_usd}: needs your approval.` };
     return { decision: "allow", reason: "Within policy." };
   }
+  // Whether a deal must settle through escrow instead of wallet to wallet. Small deals with agents that have a
+  // track record go direct; big ones, or any deal with a counterparty the owner flagged or that has too few
+  // verified deals, need escrow. verified_deals comes from the counterparty's directory listing (null = unknown).
+  needsEscrow({ usd, counterparty, verified_deals = null }) {
+    const p = this.p;
+    if (usd >= p.escrow_at_or_over_usd) return { required: true, reason: `$${usd} is at or over your $${p.escrow_at_or_over_usd} escrow threshold.` };
+    if (p.escrow_counterparties.includes(counterparty)) return { required: true, reason: "Your policy requires escrow with this counterparty." };
+    if (p.escrow_below_verified_deals > 0 && !(verified_deals >= p.escrow_below_verified_deals)) return { required: true, reason: `Counterparty has ${verified_deals ?? "unknown"} verified deals; your policy requires escrow below ${p.escrow_below_verified_deals}.` };
+    return { required: false, reason: "Direct payment allowed." };
+  }
   record(entry) { this.ledger.push({ at: new Date().toISOString(), ...entry }); }
 }
 
 // ---- deal terms ------------------------------------------------------------------------------
-const TERM_KEYS = ["deal_id", "version", "buyer", "seller", "service", "category", "deliverable", "price_usd", "network", "asset", "pay_to", "deadline", "offer_expires_at"];
+const TERM_KEYS = ["deal_id", "version", "buyer", "seller", "service", "category", "deliverable", "price_usd", "network", "asset", "pay_to", "deadline", "offer_expires_at", "settlement"];
 export function validateTerms(t) {
   if (!t || typeof t !== "object") return "terms missing";
   for (const k of Object.keys(t)) if (!TERM_KEYS.includes(k)) return `unknown term "${k}"`;
@@ -54,6 +64,7 @@ export function validateTerms(t) {
   if (!/^0x[0-9a-fA-F]{40}$/.test(t.pay_to || "")) return "pay_to must be the seller's 0x address";
   if (t.deadline != null && !(Date.parse(t.deadline) > 0)) return "deadline must be an ISO date";
   if (!(Date.parse(t.offer_expires_at) > 0)) return "offer_expires_at must be an ISO date";
+  if (t.settlement != null && !["direct", "escrow"].includes(t.settlement)) return 'settlement must be "direct" or "escrow"';
   return null;
 }
 export const termsHash = (t) => sha256(canonical(t));
@@ -228,10 +239,13 @@ export class SuppressorAgent {
     await this.post(room, m);
     return m;
   }
-  async propose(room, { buyer, seller, service, category, deliverable, price_usd, pay_to, network = "eip155:8453", deadline, expires_minutes = 60, deal_id }) {
+  async propose(room, { buyer, seller, service, category, deliverable, price_usd, pay_to, network = "eip155:8453", deadline, expires_minutes = 60, deal_id, settlement }) {
     const terms = { deal_id: deal_id || rid("dl_"), version: 1, buyer, seller, service, category, deliverable, price_usd: money(price_usd), network, asset: "USDC", pay_to, deadline, offer_expires_at: isoIn(expires_minutes * 60e3) };
+    if (settlement) terms.settlement = settlement;
+    else if (buyer === this.agentId && (await this.escrowCheck(terms)).required) terms.settlement = "escrow"; // the buyer's policy decides
     const bad = validateTerms(terms); if (bad) throw new Error("Bad terms: " + bad);
     if (![buyer, seller].includes(this.agentId)) throw new Error("You must be the buyer or the seller.");
+    await this.requireEscrowIfNeeded(terms);
     await this.dealMsg(room, "offer", { deal_id: terms.deal_id, terms, terms_hash: await termsHash(terms) });
     return terms;
   }
@@ -258,12 +272,24 @@ export class SuppressorAgent {
       if (String(t.pay_to).toLowerCase() !== mine.toLowerCase()) throw new Error("Refusing terms: pay_to isn't your receiving address.");
     }
   }
+  // Buyer side: does the owner's policy require escrow for these terms? Looks up the seller's track record.
+  async escrowCheck(t) {
+    let verified_deals = null;
+    try { verified_deals = (await this.lookup(t.seller))?.trust?.verified_deals ?? null; } catch {}
+    return this.policy.needsEscrow({ usd: t.price_usd, counterparty: t.seller, verified_deals });
+  }
+  async requireEscrowIfNeeded(t) {
+    if (t.buyer !== this.agentId || t.settlement === "escrow") return;
+    const e = await this.escrowCheck(t);
+    if (e.required) throw Object.assign(new Error(`Escrow required: ${e.reason} Counter with settlement "escrow".`), { escrow: e });
+  }
   async accept(room, deal_id) {
     const d = await this.deal(room, deal_id);
     if (d.status !== "proposed" || d.offer_by === this.agentId) throw new Error("Nothing from the other side to accept.");
     if (![d.terms.buyer, d.terms.seller].includes(this.agentId)) throw new Error("You aren't the buyer or the seller in this deal.");
     if (validateTerms(d.terms)) throw new Error("Refusing malformed terms.");
     await this.checkTermsForMe(d.terms);
+    await this.requireEscrowIfNeeded(d.terms);
     return this.dealMsg(room, "accept", { deal_id, terms_hash: d.terms_hash });
   }
   reject(room, deal_id, reason = "") { return this.dealMsg(room, "reject", { deal_id, reason: String(reason).slice(0, 500) }); }
@@ -295,6 +321,8 @@ export class SuppressorAgent {
     if (d.terms.buyer !== this.agentId) throw new Error("Only the buyer pays.");
     if (this.paying.has(deal_id) || this.policy.ledger.some((e) => e.deal_id === deal_id)) throw new Error("This deal was already paid (or is being paid) from this agent.");
     await this.checkTermsForMe(d.terms);
+    await this.requireEscrowIfNeeded(d.terms);
+    if (d.terms.settlement === "escrow") throw new Error("This deal settles through escrow, which isn't connected yet; not paying the seller directly.");
     const usd = d.terms.price_usd;
     // Category comes from the seller's own signed listing, not from terms the counterparty wrote.
     let category;
@@ -338,6 +366,7 @@ export class SuppressorAgent {
   async deliver(room, deal_id, content) {
     const d = await this.deal(room, deal_id);
     if (d.status !== "paid" || d.terms.seller !== this.agentId) throw new Error(`Only the seller can deliver a paid deal (it is ${d.status}).`);
+    if (d.terms.settlement === "escrow") throw new Error("This deal settles through escrow, which isn't connected yet; don't deliver against a direct payment.");
     await this.checkTermsForMe(d.terms); // money really goes to my address, on an allowed network
     const v = await this.verifyPayment(room, deal_id);
     if (!v.ok) throw new Error("Payment not verified on-chain yet: " + v.error);

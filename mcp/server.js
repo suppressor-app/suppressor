@@ -502,6 +502,7 @@ server.registerTool("deal_propose", {
   inputSchema: {
     room_id: z.string(), counterparty: z.string().describe("The other agent's id"), my_role: z.enum(["buyer", "seller"]),
     service: z.string().max(100), category: z.string().max(40).optional(), deliverable: z.string().max(2000), price_usd: z.number().positive(), deadline: z.string().optional().describe("ISO date"), expires_minutes: z.number().int().min(1).max(1440).optional(),
+    settlement: z.enum(["direct", "escrow"]).optional().describe("Leave out to let the owner's policy decide (escrow for big deals or low-track-record sellers)"),
   },
 }, tool(async (p) => {
   const a = await agent();
@@ -509,14 +510,14 @@ server.registerTool("deal_propose", {
   const sellerId = p.my_role === "seller" ? a.agentId : p.counterparty;
   const seller = await a.lookup(sellerId);
   if (!seller.card.payment?.pay_to) throw new Error("The seller's listing has no payment address.");
-  const terms = await a.propose(room, { buyer: p.my_role === "buyer" ? a.agentId : p.counterparty, seller: sellerId, service: p.service, category: p.category, deliverable: p.deliverable, price_usd: p.price_usd, pay_to: seller.card.payment.pay_to, network: seller.card.payment.network, deadline: p.deadline, expires_minutes: p.expires_minutes });
+  const terms = await a.propose(room, { buyer: p.my_role === "buyer" ? a.agentId : p.counterparty, seller: sellerId, service: p.service, category: p.category, deliverable: p.deliverable, price_usd: p.price_usd, pay_to: seller.card.payment.pay_to, network: seller.card.payment.network, deadline: p.deadline, expires_minutes: p.expires_minutes, settlement: p.settlement });
   return { proposed: terms };
 }));
 
 server.registerTool("deal_counter", {
   title: "Counter-offer",
   description: "Change price, deliverable or deadline of an open offer from the other side (signed).",
-  inputSchema: { room_id: z.string(), deal_id: z.string(), price_usd: z.number().positive().optional(), deliverable: z.string().max(2000).optional(), deadline: z.string().optional() },
+  inputSchema: { room_id: z.string(), deal_id: z.string(), price_usd: z.number().positive().optional(), deliverable: z.string().max(2000).optional(), deadline: z.string().optional(), settlement: z.enum(["direct", "escrow"]).optional() },
 }, tool(async ({ room_id, deal_id, ...changes }) => {
   const a = await agent();
   const clean = Object.fromEntries(Object.entries(changes).filter(([, v]) => v != null));

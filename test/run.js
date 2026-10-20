@@ -280,6 +280,28 @@ t("pay-per-room rooms cap at 7 days", () => {
   buyer.deal = async () => ({ deal_id: "dl_abcdefgh", status: "agreed", terms: { ...terms, buyer: buyer.agentId } });
   await assert.rejects(buyer.pay({}, "dl_abcdefgh"), /already paid/);
   console.log("ok agent deals: seller checks pay_to and network, payer bound, no payment reuse, no double pay"); n++;
+  // escrow routing: $100+ deals, flagged counterparties and low-track-record sellers need escrow; small deals go direct
+  const ep = new SpendingPolicy({ escrow_below_verified_deals: 3, escrow_counterparties: ["agt_shady"] });
+  assert.equal(ep.needsEscrow({ usd: 99.99, counterparty: "agt_x", verified_deals: 5 }).required, false);
+  assert.equal(ep.needsEscrow({ usd: 100, counterparty: "agt_x", verified_deals: 5 }).required, true, "threshold is inclusive");
+  assert.equal(ep.needsEscrow({ usd: 5, counterparty: "agt_shady", verified_deals: 50 }).required, true);
+  assert.equal(ep.needsEscrow({ usd: 5, counterparty: "agt_x", verified_deals: 1 }).required, true);
+  assert.equal(ep.needsEscrow({ usd: 5, counterparty: "agt_x", verified_deals: null }).required, true, "unknown track record counts as too few");
+  assert.equal(new SpendingPolicy().needsEscrow({ usd: 5, counterparty: "agt_x" }).required, false, "default: only $100+ needs escrow");
+  const { validateTerms } = await import("../clients/suppressor-sdk.js");
+  assert.equal(validateTerms({ ...terms, settlement: "escrow" }), null);
+  assert.match(validateTerms({ ...terms, settlement: "trust-me" }), /settlement/);
+  const big = await SuppressorAgent.create({ baseUrl: "http://localhost:1", payFetch: async () => { throw new Error("must not pay"); }, policy: new SpendingPolicy({ max_per_payment_usd: 500, max_per_day_usd: 500, max_total_usd: 500, require_approval_over_usd: 500 }) });
+  const bigTerms = { ...terms, buyer: big.agentId, price_usd: 150 };
+  big.deal = async () => ({ deal_id: "dl_abcdefgh", status: "agreed", terms: bigTerms });
+  await assert.rejects(big.pay({}, "dl_abcdefgh"), /Escrow required/, "a $150 deal can't be paid direct");
+  await assert.rejects(big.requireEscrowIfNeeded(bigTerms), /Escrow required/);
+  await big.requireEscrowIfNeeded({ ...bigTerms, settlement: "escrow" });
+  big.deal = async () => ({ deal_id: "dl_abcdefgh", status: "agreed", terms: { ...bigTerms, settlement: "escrow" } });
+  await assert.rejects(big.pay({}, "dl_abcdefgh"), /settles through escrow/, "escrow deals never fall back to a direct payment");
+  seller.deal = async () => ({ deal_id: "dl_abcdefgh", status: "paid", terms: { ...terms, settlement: "escrow" }, payment: { tx: "0x" + "ee".repeat(32), from: "0x" + "dd".repeat(20) } });
+  await assert.rejects(seller.deliver({}, "dl_abcdefgh", "x"), /settles through escrow/, "seller won't deliver an escrow deal against a direct payment");
+  console.log("ok escrow routing: $100+ / flagged / low-track-record deals need escrow; no direct fallback"); n++;
 }
 
 console.log(`\n${n} checks passed`);
