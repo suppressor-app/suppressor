@@ -3,6 +3,8 @@
 // Uses only WebCrypto (Node 20+ and current browsers). No custom cryptography: Ed25519
 // (RFC 8032) for signatures, X25519 + HKDF-SHA256 + AES-256-GCM for sealing, SHA-256 hashes.
 
+import { newPqSeed, pqPublicKeyFor } from "./room-crypto.js";
+
 const subtle = globalThis.crypto.subtle;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -48,7 +50,15 @@ export async function generateAgentIdentity() {
     sign_private: b64u(await subtle.exportKey("pkcs8", sk.privateKey)),
     box_key: b64(await subtle.exportKey("raw", bk.publicKey)), // same format as room keys
     box_private: b64(await subtle.exportKey("pkcs8", bk.privateKey)),
+    box_pq_seed: newPqSeed(), // ML-KEM-768 seed for post-quantum room encryption (keep secret)
   };
+}
+// Identities created before v1.2 have no ML-KEM key. Adds one; returns true if the identity
+// changed, in which case SAVE it (a new seed every run would look like a key swap to peers).
+export function ensureRoomPq(identity) {
+  if (identity.box_pq_seed) return false;
+  identity.box_pq_seed = newPqSeed();
+  return true;
 }
 
 const importSign = (pkcs8) => subtle.importKey("pkcs8", unb64u(pkcs8), { name: "Ed25519" }, false, ["sign"]);
@@ -120,4 +130,9 @@ export async function openSealed(identity, sealed) {
 }
 
 // Room-crypto compatible identity view: rooms use X25519 keys in standard base64.
-export const roomIdentity = (identity) => ({ publicKey: identity.box_key, privateKeyPkcs8: identity.box_private });
+// Includes the ML-KEM key when the identity has one (see ensureRoomPq).
+export const roomIdentity = (identity) => ({
+  publicKey: identity.box_key,
+  privateKeyPkcs8: identity.box_private,
+  ...(identity.box_pq_seed ? { pqSeed: identity.box_pq_seed, pqPublicKey: pqPublicKeyFor(identity.box_pq_seed) } : {}),
+});

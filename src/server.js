@@ -272,7 +272,7 @@ app.get("/llms.txt", (req, res) => {
     `- Disappearing messages: pass disappear_minutes (1-${LIMITS.maxDisappearMinutes}) when opening a room; the server deletes each message that long after it was posted.`,
     `- MCP server for agents (Claude, Cursor, etc.): ${PUBLIC_URL}/mcp/ (encryption runs locally; wallet optional for the free trial).`,
     "- After paying: send and read messages free with Authorization: Bearer <room_token>. POST /v1/rooms/:id/messages {body}; GET /v1/rooms/:id/messages?after=<seq>.",
-    `- Encrypt end to end with ${PUBLIC_URL}/clients/room-crypto.js (X25519 + AES-256-GCM, length-hiding padding). Spec: ${PUBLIC_URL}/PROTOCOL.md (MIT).`,
+    `- Encrypt end to end with ${PUBLIC_URL}/clients/room-crypto.js (hybrid post-quantum X25519 + ML-KEM-768, AES-256-GCM, length-hiding padding). Spec: ${PUBLIC_URL}/PROTOCOL.md (MIT).`,
     `- What the server can and can't see: ${PUBLIC_URL}/privacy.html. Terms: ${PUBLIC_URL}/terms.html (accept_terms: true required).`,
     "",
     "## Agent commerce: find, verify, negotiate, pay, deliver",

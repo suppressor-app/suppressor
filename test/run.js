@@ -221,7 +221,7 @@ t("pay-per-room rooms cap at 7 days", () => {
   const swapped = [{ member_id: "m_alice", public_key: alice.publicKey }, { member_id: "m_bob", public_key: evil.publicKey }, { member_id: "m_ghost", public_key: evil.publicKey }];
   const p2 = C.checkPins(p.pins, swapped);
   assert.equal(p2.changed.length, 1); assert.equal(p2.changed[0].member_id, "m_bob");
-  assert.equal(p2.pins.m_bob, bob.publicKey, "pinned key is kept until the user accepts");
+  assert.equal(C.pinKey(p2.pins.m_bob), bob.publicKey, "pinned key is kept until the user accepts");
   assert.deepEqual(p2.added, ["m_ghost"]);
   // Safety code v2: 30 digits, same regardless of order, changes when a key or id changes.
   const code = await C.safetyCode(members);
@@ -280,6 +280,194 @@ t("pay-per-room rooms cap at 7 days", () => {
   buyer.deal = async () => ({ deal_id: "dl_abcdefgh", status: "agreed", terms: { ...terms, buyer: buyer.agentId } });
   await assert.rejects(buyer.pay({}, "dl_abcdefgh"), /already paid/);
   console.log("ok agent deals: seller checks pay_to and network, payer bound, no payment reuse, no double pay"); n++;
+}
+
+{
+  // Post-quantum hybrid encryption (X25519 + ML-KEM-768).
+  const C = await import("../clients/room-crypto.js");
+  const room = "rm_pqtest00001";
+  const a = await C.generateIdentity(), b = await C.generateIdentity(), eve = await C.generateIdentity();
+  assert.ok(C.isValidPublicKey(a.publicKey) && C.isValidPqKey(a.pqPublicKey));
+  const mem = (id, x, pq = true) => ({ member_id: id, public_key: x.publicKey, pq_key: pq ? x.pqPublicKey : null });
+  const both = [mem("A", a), mem("B", b)];
+  const d = await C.sealDetailed(room, a, both, "quantum-proof hello");
+  const env = JSON.parse(d.body);
+  assert.equal(env.v, 2); assert.ok(d.post_quantum);
+  assert.equal(Buffer.from(env.to.B.kem, "base64").length, 1088, "ML-KEM-768 ciphertext per recipient");
+  const got = await C.openDetailed(room, b, "B", d.body, a.publicKey);
+  assert.equal(got.text, "quantum-proof hello"); assert.equal(got.post_quantum, true);
+  assert.equal(await C.open(room, a, "A", d.body, a.publicKey), "quantum-proof hello", "sender reads own hybrid history");
+  // Bindings: another room, a relabeled box, or the wrong ML-KEM secret all fail.
+  await assert.rejects(C.open("rm_other000001", b, "B", d.body));
+  const relabel = JSON.parse(d.body); relabel.to = { A: env.to.B }; // B's box handed to A
+  await assert.rejects(C.open(room, a, "A", JSON.stringify(relabel)));
+  await assert.rejects(C.open(room, { ...b, pqSeed: eve.pqSeed }, "B", d.body), "ML-KEM half required");
+  await assert.rejects(C.open(room, { ...b, privateKeyPkcs8: eve.privateKeyPkcs8 }, "B", d.body), "X25519 half required");
+  // Mixed room: an old (classical) member still gets a v1 box an old client can read.
+  const mixed = await C.sealDetailed(room, a, [mem("A", a), mem("B", b), mem("OLD", eve, false)], "hi all");
+  const menv = JSON.parse(mixed.body);
+  assert.ok(menv.to.B.kem && !menv.to.OLD.kem); assert.equal(mixed.post_quantum, false);
+  assert.equal(await C.open(room, { publicKey: eve.publicKey, privateKeyPkcs8: eve.privateKeyPkcs8 }, "OLD", mixed.body, a.publicKey), "hi all");
+  // Old identities can be upgraded in place; X25519 key unchanged.
+  const legacy = { publicKey: eve.publicKey, privateKeyPkcs8: eve.privateKeyPkcs8 };
+  assert.equal(await C.upgradeIdentity(legacy), true); assert.equal(legacy.publicKey, eve.publicKey); assert.ok(C.isValidPqKey(legacy.pqPublicKey));
+  assert.equal(await C.upgradeIdentity(legacy), false);
+  // Pins: adding a PQ key is an automatic upgrade; removing or swapping it is flagged (downgrade).
+  let p = C.checkPins({}, [mem("A", a), mem("B", b, false)]);
+  p = C.checkPins(p.pins, both); assert.deepEqual(p.upgraded, ["B"]); assert.equal(p.changed.length, 0);
+  const stripped = C.checkPins(p.pins, [mem("A", a), mem("B", b, false)]);
+  assert.equal(stripped.changed.length, 1); assert.equal(stripped.changed[0].downgrade, true);
+  const swappedPq = C.checkPins(p.pins, [mem("A", a), { ...mem("B", b), pq_key: eve.pqPublicKey }]);
+  assert.equal(swappedPq.changed.length, 1); assert.equal(swappedPq.changed[0].downgrade, false);
+  assert.deepEqual(C.checkPins(p.pins, [mem("A", a)]).gone, ["B"]);
+  assert.equal(C.checkPins({ B: b.publicKey }, both).upgraded[0], "B", "legacy string pins still work");
+  // seal() with pins refuses a stripped PQ key instead of quietly sending classical.
+  await assert.rejects(C.seal(room, a, [mem("A", a), mem("B", b, false)], "x", { pins: p.pins }), C.KeyPinMismatch);
+  // Safety code v3 covers ML-KEM keys; v2 (old clients) when anyone lacks one.
+  const code = await C.safetyCode(both);
+  assert.notEqual(code, await C.safetyCode([mem("A", a), { ...mem("B", b), pq_key: eve.pqPublicKey }]), "PQ key swap changes the code");
+  assert.equal(await C.safetyCode([mem("A", a, false), mem("B", b, false)]), await C.safetyCode([{ member_id: "A", public_key: a.publicKey }, { member_id: "B", public_key: b.publicKey }]), "v2 unchanged for old clients");
+  assert.deepEqual(C.roomPqStatus(both), { post_quantum: true, missing: [] });
+  assert.deepEqual(C.roomPqStatus([mem("A", a), mem("B", b, false)]).missing, ["B"]);
+  console.log("ok post-quantum: hybrid X25519+ML-KEM-768, bindings, mixed rooms, upgrade, downgrade flagged, safety v3"); n++;
+}
+
+{
+  // One bad key can't stop a room: malformed keys are rejected by the relay and skipped by clients.
+  const C = await import("../clients/room-crypto.js");
+  const a = await C.generateIdentity(), b = await C.generateIdentity();
+  const zeros = Buffer.alloc(32).toString("base64"); // low-order point
+  for (const badKey of ["AAAAAAAAAAAAAAAA", "not base64 at all!!", zeros.slice(0, 40)]) assert.equal(C.isValidPublicKey(badKey), false);
+  assert.equal(C.isValidPqKey(Buffer.alloc(1184, 255).toString("base64")), false, "FIPS 203 modulus check");
+  const members = [{ member_id: "A", public_key: a.publicKey, pq_key: a.pqPublicKey }, { member_id: "B", public_key: b.publicKey, pq_key: b.pqPublicKey },
+    { member_id: "X1", public_key: "AAAAAAAAAAAAAAAA" }, { member_id: "X2", public_key: zeros }, { member_id: "X3", public_key: b.publicKey.replace(/^./, "C"), pq_key: Buffer.alloc(1184, 255).toString("base64") }];
+  const d = await C.sealDetailed("rm_badkeys0001", a, members, "still works");
+  assert.ok(d.skipped.includes("X1") && d.skipped.includes("X3"), "bad keys skipped, not fatal");
+  assert.ok(!JSON.parse(d.body).to.X3, "invalid PQ key is skipped, never downgraded to classical");
+  assert.equal(await C.open("rm_badkeys0001", b, "B", d.body, a.publicKey), "still works");
+  console.log("ok hardening: malformed and low-order keys skipped, room keeps working"); n++;
+}
+
+t("hardening: leave frees the seat, owner remove, invite rotate and lock, view-once cleanup", () => {
+  const { room, token, invite } = S.createRoom({ max_members: 3 });
+  const j1 = S.joinRoom(room, {}), j2 = S.joinRoom(room, {});
+  assert.equal(room.members.length, 3);
+  const owner = S.memberFor(room.id, token).member;
+  // view-once photo to both members; one opens it, the other leaves -> it's deleted.
+  const ph = S.putBlob(room, owner, Buffer.from("cipher"), true);
+  assert.ok(S.getBlob(room, S.memberFor(room.id, j1.token).member, ph.blob_id).data);
+  assert.ok(S.removeMember(room, j2.member_id));
+  assert.equal(S.getBlob(room, owner, ph.blob_id).status, 410, "view-once photo dropped once everyone remaining opened it");
+  assert.equal(S.memberFor(room.id, j2.token).member, null, "left member's token is dead");
+  assert.equal(room.members.length, 2, "seat is free again");
+  assert.ok(S.roomByInvite(invite));
+  const fresh = S.rotateInvite(room);
+  assert.equal(S.roomByInvite(invite), null, "old invite stops working"); assert.equal(S.roomByInvite(fresh).id, room.id);
+  assert.equal(S.rotateInvite(room, { lock: true }), null);
+  assert.equal(S.roomByInvite(fresh), null); assert.equal(S.roomInfo(room, owner).joins_locked, true);
+  S.closeRoom(room);
+});
+
+t("hardening: PQ keys stored, key replacement semantics, disappearing clock rounded, rate map pruned", () => {
+  const { room, token } = S.createRoom({ max_members: 2, public_key: "x".repeat(44), pq_key: "p", disappear_minutes: 5 });
+  const m = S.memberFor(room.id, token).member;
+  assert.equal(S.roomInfo(room, m).members[0].pq_key, "p");
+  S.setKey(m, "x".repeat(44), "q"); assert.equal(m.pq_key, "q", "pq-only update");
+  S.setKey(m, "x".repeat(44)); assert.equal(m.pq_key, "q", "same key, pq kept");
+  S.setKey(m, "y".repeat(44)); assert.equal(m.pq_key, null, "new identity clears the old ML-KEM key");
+  S.postMessage(room, m, "sealed");
+  assert.equal(room.messages[0].posted % 60e3, 0, "no millisecond timestamps, even for disappearing messages");
+  assert.ok(room.messages[0].posted >= Date.now() - 1000);
+  S.closeRoom(room);
+});
+
+{
+  // HTTP: the relay rejects bad keys before doing anything, and the new endpoints work end to end.
+  const express = (await import("express")).default;
+  const R = await import("../src/rooms/routes.js");
+  const C = await import("../clients/room-crypto.js");
+  const app = express(); app.use(express.json({ limit: "2mb" }));
+  R.mountHandlers(app, { adminToken: null });
+  const srv = app.listen(0); const base = `http://127.0.0.1:${srv.address().port}`;
+  const call = async (method, path, body, tok) => { const r = await fetch(base + path, { method, headers: { "content-type": "application/json", ...(tok ? { authorization: `Bearer ${tok}` } : {}) }, body: body ? JSON.stringify(body) : undefined }); return { status: r.status, j: await r.json().catch(() => ({})) }; };
+  const a = await C.generateIdentity(), b = await C.generateIdentity(), c = await C.generateIdentity();
+  assert.equal((await call("POST", "/v1/rooms/trial", { accept_terms: true, public_key: "AAAAAAAAAAAAAAAA" })).status, 400);
+  assert.equal((await call("POST", "/v1/rooms/trial", { accept_terms: true, public_key: a.publicKey, pq_key: "short" })).status, 400);
+  const { pass } = S.buyPass();
+  const opened = S.createRoom({ max_members: 3, public_key: a.publicKey, pq_key: a.pqPublicKey, pass });
+  const rid = opened.room.id;
+  const jb = await call("POST", "/v1/rooms/join-free", { invite_code: opened.invite, public_key: b.publicKey, pq_key: b.pqPublicKey });
+  assert.equal(jb.status, 200); assert.equal(jb.j.room.members.find((m) => m.member_id === jb.j.member_id).pq_key, b.pqPublicKey);
+  // hybrid message through the relay
+  const info = (await call("GET", `/v1/rooms/${rid}`, null, opened.token)).j;
+  const sealed = await C.sealDetailed(rid, a, info.members, "over the wire");
+  assert.ok(sealed.post_quantum);
+  assert.equal((await call("POST", `/v1/rooms/${rid}/messages`, { body: sealed.body }, opened.token)).status, 201);
+  const read = (await call("GET", `/v1/rooms/${rid}/messages?after=0`, null, jb.j.room_token)).j;
+  assert.equal(await C.open(rid, b, jb.j.member_id, read.messages[0].body, a.publicKey), "over the wire");
+  // PUT key: bad keys refused
+  assert.equal((await call("PUT", `/v1/rooms/${rid}/key`, { public_key: b.publicKey, pq_key: Buffer.alloc(1184, 255).toString("base64") }, jb.j.room_token)).status, 400);
+  // invite rotate + lock (owner only)
+  assert.equal((await call("POST", `/v1/rooms/${rid}/invite`, {}, jb.j.room_token)).status, 403);
+  const rot = (await call("POST", `/v1/rooms/${rid}/invite`, {}, opened.token)).j;
+  assert.equal((await call("POST", "/v1/rooms/join-free", { invite_code: opened.invite, public_key: c.publicKey })).status, 404, "old invite dead");
+  assert.equal((await call("POST", `/v1/rooms/${rid}/invite`, { lock: true }, opened.token)).j.joins_locked, true);
+  assert.equal((await call("POST", "/v1/rooms/join-free", { invite_code: rot.invite_code, public_key: c.publicKey })).status, 404, "locked");
+  // leave / remove
+  assert.equal((await call("POST", `/v1/rooms/${rid}/leave`, {}, opened.token)).status, 409, "owner closes instead");
+  assert.equal((await call("DELETE", `/v1/rooms/${rid}/members/${jb.j.member_id}`, null, jb.j.room_token)).status, 403);
+  assert.equal((await call("POST", `/v1/rooms/${rid}/leave`, {}, jb.j.room_token)).j.left, true);
+  assert.equal((await call("GET", `/v1/rooms/${rid}`, null, jb.j.room_token)).status, 401, "token dead after leaving");
+  assert.equal((await call("GET", `/v1/rooms/${rid}`, null, opened.token)).j.members.length, 1);
+  srv.close(); S.closeRoom(opened.room);
+  console.log("ok relay HTTP: strict key validation, PQ keys, hybrid over the wire, invite rotate/lock, leave/remove"); n++;
+}
+
+{
+  // SDK end to end through a real relay: agents get hybrid PQ rooms, joins are announced, lock and leave work.
+  const express = (await import("express")).default;
+  const R = await import("../src/rooms/routes.js");
+  const { SuppressorAgent } = await import("../clients/suppressor-sdk.js");
+  const AI = await import("../clients/agent-identity.js");
+  const app = express(); app.use(express.json({ limit: "2mb" }));
+  R.mountHandlers(app, { adminToken: null });
+  const srv = app.listen(0); const baseUrl = `http://127.0.0.1:${srv.address().port}`;
+  const { key: passKey } = S.buyPass();
+  const A = await SuppressorAgent.create({ baseUrl, passKey }), B = await SuppressorAgent.create({ baseUrl }), Cg = await SuppressorAgent.create({ baseUrl }), D = await SuppressorAgent.create({ baseUrl });
+  assert.ok(A.id.box_pq_seed, "new agent identities carry an ML-KEM seed");
+  const ra = await A.openRoom({ maxMembers: 3 });
+  await A.refreshKeys(ra); // seen with only the owner present
+  const rb = await B.joinRoom(ra.invite_code);
+  const sent = await A.post(ra, { type: "text", text: "pq hello" });
+  assert.equal(sent.post_quantum, true, "every agent has an ML-KEM key, so boxes are hybrid");
+  const logB = await B.read(rb);
+  assert.ok(logB.some((e) => e.msg.type === "text" && e.msg.text === "pq hello"));
+  assert.ok(ra.log.some((e) => e.msg.type === "member_joined" && e.msg.member_id === rb.member_id), "B's join announced to A");
+  const rc = await Cg.joinRoom(ra.invite_code);
+  await A.refreshKeys(ra);
+  assert.ok(ra.log.some((e) => e.msg.type === "member_joined" && e.msg.member_id === rc.member_id), "third member announced");
+  await A.lockJoins(ra);
+  await assert.rejects(D.joinRoom(ra.invite_code), /not found/i, "locked room refuses joins");
+  await Cg.leave(rc);
+  await A.refreshKeys(ra);
+  assert.ok(ra.log.some((e) => e.msg.type === "member_left" && e.msg.member_id === rc.member_id));
+  // A legacy agent (no ML-KEM seed) still talks classically, and upgrading adds PQ without a key-swap alarm.
+  const legacy = await AI.generateAgentIdentity(); delete legacy.box_pq_seed;
+  const L = new SuppressorAgent({ baseUrl, identity: legacy });
+  const rb2 = await B.openRoom({ mode: "trial" });
+  await B.refreshKeys(rb2);
+  const rl = await L.joinRoom(rb2.invite_code);
+  assert.equal((await B.post(rb2, { type: "text", text: "classical" })).post_quantum, false);
+  assert.ok((await L.read(rl)).some((e) => e.msg.text === "classical"));
+  assert.equal(AI.ensureRoomPq(legacy), true);
+  rl.me = AI.roomIdentity(legacy);
+  await L.refreshKeys(rl); // publishes the new ML-KEM key
+  await B.refreshKeys(rb2);
+  assert.equal(rb2.keyAlert, null, "adding a PQ key is an upgrade, not a key swap");
+  assert.equal((await B.post(rb2, { type: "text", text: "now hybrid" })).post_quantum, true);
+  assert.ok((await L.read(rl)).some((e) => e.msg.text === "now hybrid"));
+  srv.close();
+  console.log("ok SDK end to end: hybrid PQ agent rooms, joins/leaves announced, lock, legacy agents upgrade cleanly"); n++;
 }
 
 console.log(`\n${n} checks passed`);

@@ -87,6 +87,12 @@ export function initStore(dataDir) {
   setInterval(sweep, 20000).unref();
   for (const sig of ["SIGTERM", "SIGINT"]) process.once(sig, () => { save(); process.exit(0); });
 }
+let saveTimer = null;
+function saveSoon() {
+  if (!dataFile || saveTimer) return;
+  saveTimer = setTimeout(() => { saveTimer = null; save(); }, 250);
+  saveTimer.unref?.();
+}
 function save() {
   if (!dataFile || !dirty) return;
   try {
@@ -107,7 +113,9 @@ export function sweep() {
     if (r.disappear_ms) dropExpiredMessages(r, t);
   }
   for (const [h, ps] of passes) if (ps.expires_at + LIMITS.passGraceDays * 86400e3 <= t) { passes.delete(h); dirty = true; }
+  for (const [k, b] of buckets) if (!b.length || t - b[b.length - 1] >= 60e3) buckets.delete(k); // rate-limit history is only needed for a minute
   recount();
+  if (dirty) saveSoon();
   for (const [rid, m] of blobs) {
     const r = rooms.get(rid);
     if (!r) { dropBlobs(rid); continue; }
@@ -169,7 +177,7 @@ export function trialQuota(ip) {
 
 // Room labels are NOT sent to or stored by the server: clients keep them locally and
 // pass them inside the invite link's #fragment, which browsers never transmit.
-export function createRoom({ max_members = 2, public_key, trial = false, disappear_minutes = null, pass = null }) {
+export function createRoom({ max_members = 2, public_key, pq_key = null, trial = false, disappear_minutes = null, pass = null }) {
   const id = "rm_" + rand(12);
   const invite = (trial ? "trial_" : pass ? "free_" : "inv_") + rand(18);
   const token = "tok_" + rand(32);
@@ -188,7 +196,7 @@ export function createRoom({ max_members = 2, public_key, trial = false, disappe
     msg_count: 0,
     seq: 0,
     invite_hash: hash(invite),
-    members: [{ member_id, role: "owner", token_hash: hash(token), public_key: public_key || null, joined_at: now() }],
+    members: [{ member_id, role: "owner", token_hash: hash(token), public_key: public_key || null, pq_key: pq_key || null, joined_at: now() }],
     messages: [],
   };
   rooms.set(id, r);
@@ -198,10 +206,10 @@ export function createRoom({ max_members = 2, public_key, trial = false, disappe
   return { room: r, token, invite, member_id };
 }
 
-export function joinRoom(r, { public_key }) {
+export function joinRoom(r, { public_key, pq_key = null }) {
   const token = "tok_" + rand(32);
   const member_id = "m_" + rand(6);
-  r.members.push({ member_id, role: "member", token_hash: hash(token), public_key: public_key || null, joined_at: now() });
+  r.members.push({ member_id, role: "member", token_hash: hash(token), public_key: public_key || null, pq_key: pq_key || null, joined_at: now() });
   dirty = true;
   return { token, member_id };
 }
@@ -236,7 +244,9 @@ export function postMessage(r, member, body) {
     if (passBytes + body.length > LIMITS.passTotalBytes) return { error: "Your pass's rooms are holding a lot of messages. Close a few rooms you're done with.", status: 409 };
   } else if ((r.bytes || 0) + body.length > LIMITS.maxRoomBytes) return { error: "Room storage is full. Close it and open a new one.", status: 409 };
   // Timestamps are stored rounded to the minute: enough to order and display, less to profile.
-  const msg = { seq: ++r.seq, from: member.member_id, body, at: Math.floor(t / 60e3) * 60e3, posted: r.disappear_ms ? t : undefined };
+  // Disappearing rooms keep the deletion clock rounded UP to the minute (never exact
+  // milliseconds, in memory or in the snapshot), so messages go at most a minute late.
+  const msg = { seq: ++r.seq, from: member.member_id, body, at: Math.floor(t / 60e3) * 60e3, posted: r.disappear_ms ? Math.ceil(t / 60e3) * 60e3 : undefined };
   r.messages.push(msg);
   r.bytes = (r.bytes || 0) + body.length;
   totalBytes += body.length;
@@ -250,15 +260,48 @@ export function readMessages(r, after = 0, limit = 200) {
   return r.messages.filter((m) => m.seq > after).slice(0, Math.min(500, limit)).map(publicMsg);
 }
 
-export function setKey(member, public_key) {
+// Replacing the X25519 key replaces the whole identity: the ML-KEM key is cleared unless a new
+// one is sent. Sending only a new pq_key with the same public_key adds/replaces just that.
+export function setKey(member, public_key, pq_key) {
+  if (pq_key === undefined && public_key !== member.public_key) member.pq_key = null;
+  else if (pq_key !== undefined) member.pq_key = pq_key || null;
   member.public_key = public_key;
   dirty = true;
+}
+
+// ---- membership: leave, remove, invites --------------------------------------------
+// Leaving frees the seat, stops new messages being sealed to it, and drops it from photo
+// recipient lists (so view-once photos don't wait forever for someone who left).
+export function removeMember(r, member_id) {
+  const i = r.members.findIndex((m) => m.member_id === member_id);
+  if (i < 0) return false;
+  const [m] = r.members.splice(i, 1);
+  buckets.delete(m.token_hash);
+  const bm = blobs.get(r.id);
+  if (bm) for (const [bid, b] of [...bm]) {
+    b.recipients.delete(member_id);
+    if (b.from === member_id && b.once && !b.recipients.size) dropBlob(r.id, bid);
+    else if (b.once && [...b.recipients].every((x) => b.opened.has(x))) dropBlob(r.id, bid);
+  }
+  dirty = true;
+  return true;
+}
+// Owner: replace the invite code (old links stop working) or lock the room to new joins.
+export function rotateInvite(r, { lock = false } = {}) {
+  if (r.invite_hash) inviteIndex.delete(r.invite_hash);
+  if (lock) { r.invite_hash = null; dirty = true; return null; }
+  const invite = (r.trial ? "trial_" : r.pass_hash ? "free_" : "inv_") + rand(18);
+  r.invite_hash = hash(invite);
+  inviteIndex.set(r.invite_hash, r.id);
+  dirty = true;
+  return invite;
 }
 
 export function closeRoom(r, status = "closed") {
   r.status = status;
   r.messages = [];
   destroy(r.id);
+  saveSoon(); // don't leave a closed room's ciphertext in the snapshot for up to 15 seconds
 }
 
 export const publicMsg = (m) => ({ seq: m.seq, from: m.from, body: m.body, at: iso(m.at) });
@@ -268,7 +311,8 @@ export const roomInfo = (r, me) => ({
   you: me?.member_id ?? null,
   expires_at: iso(r.expires_at),
   max_members: r.max_members,
-  members: r.members.map((m) => ({ member_id: m.member_id, role: m.role, public_key: m.public_key, joined_at: iso(m.joined_at) })),
+  members: r.members.map((m) => ({ member_id: m.member_id, role: m.role, public_key: m.public_key, pq_key: m.pq_key || null, joined_at: iso(m.joined_at) })),
+  joins_locked: !r.invite_hash,
   messages_used: r.msg_count,
   message_limit: r.msg_limit,
   extendable: canExtend(r),

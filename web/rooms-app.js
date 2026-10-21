@@ -4,7 +4,7 @@
 import { wrapFetchWithPaymentFromConfig } from "@x402/fetch";
 import { ExactEvmScheme } from "@x402/evm";
 import { createWalletClient, custom } from "viem";
-import { generateIdentity, seal, open, encryptBlob, decryptBlob, checkPins, safetyCode, SenderKeyMismatch } from "../clients/room-crypto.js";
+import { generateIdentity, upgradeIdentity, seal, open, encryptBlob, decryptBlob, checkPins, safetyCode, roomPqStatus, SenderKeyMismatch } from "../clients/room-crypto.js";
 
 const $ = (s) => document.querySelector(s);
 const show = (id) => document.querySelectorAll("[data-view]").forEach((el) => (el.hidden = el.dataset.view !== id));
@@ -224,6 +224,7 @@ async function openRoom(e) {
       max_members: Number($("#size").value),
       disappear_minutes: disappearChoice(),
       public_key: me.publicKey,
+      pq_key: me.pqPublicKey,
     }, getPass().key);
     remember({ room_id: r.room_id, member_id: r.member_id, token: r.room_token, invite: r.invite_code, owner: true, me, name: $("#name").value.trim(), label: $("#label").value.trim() });
     status("");
@@ -246,6 +247,7 @@ async function openTrial() {
       accept_terms: true,
       disappear_minutes: disappearChoice(),
       public_key: me.publicKey,
+      pq_key: me.pqPublicKey,
     });
     remember({ room_id: r.room_id, member_id: r.member_id, token: r.room_token, invite: r.invite_code, owner: true, me, name: $("#name").value.trim(), label: $("#label").value.trim() });
     status("");
@@ -268,7 +270,7 @@ async function joinRoom(e) {
   try {
     const me = await generateIdentity();
     status("Joining…");
-    const r = await api(fetch, "POST", "/v1/rooms/join-free", { invite_code: invite, public_key: me.publicKey });
+    const r = await api(fetch, "POST", "/v1/rooms/join-free", { invite_code: invite, public_key: me.publicKey, pq_key: me.pqPublicKey });
     remember({ room_id: r.room_id, member_id: r.member_id, token: r.room_token, owner: false, me, name: $("#jname").value.trim(), label });
     status("");
     location.hash = `room=${r.room_id}`;
@@ -302,6 +304,8 @@ async function enterRoom(id) {
   $("#room-title").textContent = creds.label || "Private room";
   $("#invite-row").hidden = !creds.owner;
   $("#close-btn").hidden = !creds.owner;
+  $("#forget-btn").textContent = creds.owner ? "Forget here" : "Leave room";
+  $("#forget-btn").title = creds.owner ? "Delete this room's keys from this device (the room stays open; close it to end it)" : "Leave the room and delete its keys from this device";
   if (creds.owner) $("#invite-link").value = inviteLink(creds);
   show("room");
   await refreshInfo();
@@ -317,8 +321,19 @@ async function enterRoom(id) {
 async function refreshInfo() {
   if (!current) return;
   try {
-    const info = await api(fetch, "GET", `/v1/rooms/${current.creds.room_id}`, null, current.creds.token);
+    // Rooms from before post-quantum support: add an ML-KEM key and publish it (same X25519 key).
+    if (await upgradeIdentity(current.creds.me)) remember(current.creds);
+    let info = await api(fetch, "GET", `/v1/rooms/${current.creds.room_id}`, null, current.creds.token);
+    const mine = info.members.find((m) => m.member_id === current.creds.member_id);
+    if (mine && mine.public_key === current.creds.me.publicKey && mine.pq_key !== current.creds.me.pqPublicKey)
+      info = await api(fetch, "PUT", `/v1/rooms/${current.creds.room_id}/key`, { public_key: current.creds.me.publicKey, pq_key: current.creds.me.pqPublicKey }, current.creds.token);
     current.info = info;
+    const pq = roomPqStatus(info.members);
+    $("#lock-label").textContent = pq.post_quantum ? "● post-quantum encrypted" : "● encrypted";
+    $("#lock-label").title = pq.post_quantum
+      ? "End-to-end encrypted with hybrid X25519 + ML-KEM-768 (post-quantum) keys for every member."
+      : "End-to-end encrypted (X25519). Someone here is on an older app without a post-quantum key, so their copies use classical encryption only.";
+    if (current.creds.owner) { $("#invite-row").hidden = !!info.joins_locked; $("#locked-note").hidden = !info.joins_locked; }
     info.members.forEach((m, i) => current.members.set(m.member_id, i));
     const others = info.members.length - 1;
     $("#trial-note").hidden = !info.trial;
@@ -368,11 +383,13 @@ function notice(text) {
 function verifyKeys(info) {
   const c = current, creds = c.creds;
   const seeded = !!creds.pins;
-  if (!creds.pins) creds.pins = { [creds.member_id]: creds.me.publicKey };
+  if (!creds.pins) creds.pins = { [creds.member_id]: { k: creds.me.publicKey, pq: creds.me.pqPublicKey || null } };
   const res = checkPins(creds.pins, info.members);
   creds.pins = res.pins;
+  for (const id of res.gone) delete creds.pins[id];
   remember(creds);
   if (seeded) for (const id of res.added) notice(`${who(id)} joined. The safety code changed, so compare it again.`);
+  if (seeded) for (const id of res.gone) notice(`${who(id)} left the room.`);
   c.keyAlert = res.changed.length ? res.changed : null;
   showKeyAlert();
 }
@@ -394,7 +411,9 @@ function showKeyAlert() {
   t.style.margin = "0 0 8px";
   t.textContent = self
     ? "Security warning: the server is showing a different key for you than the one on this device. Don't use this room. Close it and open a new one."
-    : `Security warning: the server is now showing a different key for ${c.keyAlert.map((x) => who(x.member_id)).join(", ")}. Sending is paused and their messages under the new key are hidden. Call them and compare the safety code. Only if it matches, trust the new key.`;
+    : c.keyAlert.every((x) => x.downgrade)
+      ? `Security warning: the server stopped showing the post-quantum key for ${c.keyAlert.map((x) => who(x.member_id)).join(", ")}. That would weaken encryption to them, so sending is paused. Call them and compare the safety code. Only if it matches (for example, they reinstalled an older app), trust the change.`
+      : `Security warning: the server is now showing a different key for ${c.keyAlert.map((x) => who(x.member_id)).join(", ")}. Sending is paused and their messages under the new key are hidden. Call them and compare the safety code. Only if it matches, trust the new key.`;
   el.append(t);
   if (!self) {
     const btn = document.createElement("button");
@@ -488,7 +507,7 @@ async function send(e) {
   try {
     await refreshInfo();
     if (current.keyAlert) return status("Sending is paused until the key warning above is resolved.", "err");
-    const sealed = await seal(current.creds.room_id, current.creds.me, current.info.members, JSON.stringify({ type: "text", text, name: current.creds.name || undefined }));
+    const sealed = await seal(current.creds.room_id, current.creds.me, current.info.members, JSON.stringify({ type: "text", text, name: current.creds.name || undefined }), { pins: current.creds.pins, myMemberId: current.creds.member_id });
     await api(fetch, "POST", `/v1/rooms/${current.creds.room_id}/messages`, { body: sealed }, current.creds.token);
     input.value = "";
     await poll();
@@ -509,12 +528,30 @@ async function closeRoom() {
   location.hash = "";
 }
 
-function forgetHere() {
-  if (!confirm("Remove this room's keys from this device? You won't be able to read or rejoin it here. The room stays open for the others.")) return;
+// Members leave for real (frees the seat; nothing more is sealed to them). Owners only forget
+// the keys here; ending the room is "Close room".
+async function forgetHere() {
+  const owner = current.creds.owner;
+  if (!confirm(owner
+    ? "Remove this room's keys from this device? You won't be able to read it here. The room stays open for the others until you close it or it expires."
+    : "Leave this room? Your seat is freed, you won't get new messages, and its keys are deleted from this device.")) return;
+  if (!owner) { try { await api(fetch, "POST", `/v1/rooms/${current.creds.room_id}/leave`, {}, current.creds.token); } catch {} }
   const id = current.creds.room_id;
   stop();
   forget(id);
   location.hash = "";
+}
+
+async function changeInvite(lock) {
+  if (lock && !confirm("Lock the room? Nobody else will be able to join, even with the invite link.")) return;
+  if (!lock && !confirm("Make a new invite link? The current link stops working.")) return;
+  try {
+    const r = await api(fetch, "POST", `/v1/rooms/${current.creds.room_id}/invite`, lock ? { lock: true } : {}, current.creds.token);
+    if (lock) { current.creds.invite = null; status("Room locked. Nobody else can join.", "ok"); }
+    else { current.creds.invite = r.invite_code; $("#invite-link").value = inviteLink(current.creds); status("New invite link ready. The old one no longer works.", "ok"); }
+    remember(current.creds);
+    await refreshInfo();
+  } catch (err) { status(err.message, "err"); }
 }
 
 async function report() {
@@ -582,7 +619,7 @@ async function sendPhoto(caption) {
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || `Upload failed (${r.status})`);
     const msg = { type: "image", blob: j.blob_id, key: enc.key, iv: enc.iv, w: p.w, h: p.h, once, caption: caption || undefined, name: c.creds.name || undefined };
-    const sealed = await seal(c.creds.room_id, c.creds.me, c.info.members, JSON.stringify(msg));
+    const sealed = await seal(c.creds.room_id, c.creds.me, c.info.members, JSON.stringify(msg), { pins: c.creds.pins, myMemberId: c.creds.member_id });
     await api(fetch, "POST", `/v1/rooms/${c.creds.room_id}/messages`, { body: sealed }, c.creds.token);
     enc.data.fill(0);
     discardPhoto();
@@ -792,6 +829,8 @@ async function main() {
   $("#close-btn").addEventListener("click", closeRoom);
   $("#report-btn").addEventListener("click", report);
   $("#forget-btn").addEventListener("click", forgetHere);
+  $("#new-invite").addEventListener("click", () => changeInvite(false));
+  $("#lock-room").addEventListener("click", () => changeInvite(true));
   $("#pass-buy").addEventListener("click", () => buyPass("pro"));
   $("#pass-renew").addEventListener("click", renewPass);
   $("#pass-show").addEventListener("click", () => showKey(false));

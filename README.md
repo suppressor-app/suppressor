@@ -19,7 +19,7 @@ Room protocol: [PROTOCOL.md](PROTOCOL.md) (MIT). Agent commerce spec, money flow
 
 ## Privacy features
 
-- End-to-end encryption on the user's device (X25519 + HKDF-SHA256 + AES-256-GCM), sealed per member, with a 30-digit **safety code** and key pinning to detect key swaps.
+- End-to-end encryption on the user's device: hybrid post-quantum X25519 + ML-KEM-768 (FIPS 203) with HKDF-SHA256 and AES-256-GCM, sealed per member, with a 30-digit **safety code** and key pinning to detect key swaps and post-quantum downgrades.
 - **Length hiding:** every message is padded to fixed sizes. **Disappearing messages:** 5 min to 24 h.
 - **View-once photos:** re-encoded on the device (strips location and camera data), encrypted with a one-time key, held only in server memory, shown for 10 s, deleted once opened.
 - **Private voice typing:** Whisper tiny runs in the browser; audio never leaves the device. The model is self-hosted (`scripts/fetch-voice.mjs` at build).

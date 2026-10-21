@@ -218,14 +218,14 @@ h2 { font: 800 1.7rem/1 var(--display); text-transform: uppercase; margin: 0 0 6
     <div class="room-head">
       <div>
         <h2 id="room-title">Private room</h2>
-        <div class="meta"><span class="lock">● encrypted</span> · <span id="room-meta"></span></div>
+        <div class="meta"><span class="lock" id="lock-label" title="End-to-end encrypted. Post-quantum: every member has an ML-KEM-768 key, so messages use hybrid X25519 + ML-KEM encryption.">● encrypted</span> · <span id="room-meta"></span></div>
         <div class="meta" title="Compare this code with the other members by phone or in person. If it matches, nobody intercepted your keys.">Safety code: <span id="safety" style="color:var(--ink)">…</span></div>
       </div>
       <div class="actions">
-        <button class="btn line small" id="forget-btn" type="button" title="Delete this room's keys from this device">Forget here</button>
+        <button class="btn line small" id="forget-btn" type="button" title="Leave the room and delete its keys from this device">Leave room</button>
         <button class="btn line small" id="report-btn" type="button">Report</button>
         <button class="btn line small danger" id="close-btn" type="button">Close room</button>
-        <a class="btn line small" href="#">Leave</a>
+        <a class="btn line small" href="#">Back</a>
       </div>
     </div>
     <div>
@@ -236,7 +236,10 @@ h2 { font: 800 1.7rem/1 var(--display); text-transform: uppercase; margin: 0 0 6
       <div class="invite" id="invite-row">
         <input type="text" id="invite-link" readonly aria-label="Invite link">
         <button class="btn small" id="copy-invite" type="button">Copy invite</button>
+        <button class="btn line small" id="new-invite" type="button" title="Replace the invite link. The old link stops working.">New link</button>
+        <button class="btn line small" id="lock-room" type="button" title="Stop anyone else from joining. Do this once everyone you expect is in.">Lock room</button>
       </div>
+      <div class="waiting" id="locked-note" hidden>Room locked: nobody else can join.</div>
       <div class="waiting" id="trial-note" hidden>Free trial room: 30 minutes and 50 messages. For unlimited rooms and messages, get the <a href="#">monthly pass</a> (<span data-price="pass-buy">$5</span>).</div>
       <div class="waiting" id="waiting">Waiting for someone to join. Send them the invite link. Messages can be sent once they're in.</div>
     </div>
