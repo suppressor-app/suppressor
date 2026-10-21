@@ -470,4 +470,157 @@ t("hardening: PQ keys stored, key replacement semantics, disappearing clock roun
   console.log("ok SDK end to end: hybrid PQ agent rooms, joins/leaves announced, lock, legacy agents upgrade cleanly"); n++;
 }
 
+{
+  // v1.3 review fixes: pins survive leaves, replay protection, long messages.
+  const C = await import("../clients/room-crypto.js");
+  const { SuppressorAgent } = await import("../clients/suppressor-sdk.js");
+  const a = await C.generateIdentity(), b = await C.generateIdentity(), evil = await C.generateIdentity();
+  const mem = (id, x) => ({ member_id: id, role: "member", public_key: x.publicKey, pq_key: x.pqPublicKey });
+  // Pins: a member who "left" and comes back under the same id with other keys is a key change.
+  let p = C.checkPins({}, [mem("A", a), mem("B", b)]);
+  p = C.checkPins(p.pins, [mem("A", a)]);
+  assert.deepEqual(p.gone, ["B"]); assert.equal(p.pins.B.left, true, "pin kept, marked left");
+  assert.deepEqual(C.checkPins(p.pins, [mem("A", a)]).gone, [], "left is reported once");
+  const back = C.checkPins(p.pins, [mem("A", a), mem("B", evil)]);
+  assert.equal(back.changed.length, 1); assert.equal(back.changed[0].returning, true); assert.deepEqual(back.added, []);
+  const same = C.checkPins(p.pins, [mem("A", a), mem("B", b)]);
+  assert.deepEqual(same.returned, ["B"]); assert.equal(same.changed.length, 0); assert.equal(same.pins.B.left, undefined);
+  // ...and through the SDK, as a dishonest relay would do it.
+  const ag = await SuppressorAgent.create({ baseUrl: "http://relay" });
+  let shown = [mem("A", a), mem("B", b)];
+  ag.http = async () => ({ members: shown });
+  const room = { room_id: "rm_pinkeep", member_id: "A", me: a, token: "t" };
+  await ag.refreshKeys(room); shown = [mem("A", a)]; await ag.refreshKeys(room);
+  shown = [mem("A", a), mem("B", evil)]; await ag.refreshKeys(room);
+  assert.ok(room.keyAlert?.[0]?.member_id === "B", "relay can't re-add a member id with new keys unnoticed");
+  await assert.rejects(ag.post(room, { type: "text", text: "x" }), /Key changed/);
+
+  // Replay: the counter and id ride inside the encryption; the same message under a new seq is refused.
+  const members = [mem("A", a), mem("B", b)];
+  const env = await C.seal("rm_replay01", a, members, "hello");
+  const o1 = await C.openDetailed("rm_replay01", b, "B", env, a.publicKey);
+  assert.ok(o1.meta && o1.meta.counter > 0 && /^20\d\d-/.test(o1.meta.sent_at));
+  const g = new C.ReplayGuard();
+  assert.equal(g.check(o1.from_key, o1.meta, 5), null);
+  assert.equal(g.check(o1.from_key, o1.meta, 5), null, "re-reading the same seq is fine");
+  assert.match(g.check(o1.from_key, o1.meta, 9), /Replayed/, "same message under a new seq is refused");
+  const o2 = await C.openDetailed("rm_replay01", b, "B", await C.seal("rm_replay01", a, members, "again"), a.publicKey);
+  assert.ok(o2.meta.counter > o1.meta.counter, "counters increase"); assert.equal(g.check(o2.from_key, o2.meta, 10), null);
+  assert.match(g.check(o1.from_key, null, 11), /replay protection/, "an unprotected message from a protected sender is refused");
+  assert.equal(g.check(o1.from_key, null, 2), null, "older unprotected history (before the upgrade) still reads");
+  const g2 = new C.ReplayGuard(JSON.parse(JSON.stringify(g.state())));
+  assert.match(g2.check(o1.from_key, o1.meta, 12), /Replayed/, "state survives a save and reload");
+  // Through the SDK: the relay serving the same envelope twice shows it once.
+  const bReader = await SuppressorAgent.create({ baseUrl: "http://relay" });
+  let seq = 0;
+  bReader.http = async (m, path) => (path.includes("/messages") ? { messages: [{ seq: ++seq, from: "A", at: "", body: env }], last_seq: seq } : { members });
+  const rb = { room_id: "rm_replay01", member_id: "B", me: b, token: "t", last: 0 };
+  await bReader.refreshKeys(rb); await bReader.read(rb); await bReader.read(rb);
+  assert.equal(rb.log.filter((e) => e.msg.text === "hello").length, 1);
+  assert.equal(rb.log.filter((e) => e.msg.type === "replayed").length, 1);
+  // Long messages: getRandomValues is filled in 64 KB chunks (no QuotaExceededError).
+  const big = "x".repeat(200000);
+  assert.equal(await C.open("rm_replay01", b, "B", await C.seal("rm_replay01", a, members, big), a.publicKey), big);
+  console.log("ok review fixes: pins survive leave/rejoin, authenticated replay protection, long messages"); n++;
+}
+
+{
+  // Payments: the budget is held atomically, so parallel payments can't exceed the limits.
+  const { SuppressorAgent, SpendingPolicy } = await import("../clients/suppressor-sdk.js");
+  const mk = async (policy, settle = "ok") => {
+    const buyer = await SuppressorAgent.create({ baseUrl: "http://relay", policy, payFetch: async () => {} });
+    const seller = "agt_" + "s".repeat(26);
+    buyer.deal = async (_r, id) => { await new Promise((r) => setTimeout(r, 5)); return { deal_id: id, status: "agreed", terms: { deal_id: id, version: 1, buyer: buyer.agentId, seller, service: "s", deliverable: "d", price_usd: 4, network: "eip155:8453", asset: "USDC", pay_to: "0x" + "aa".repeat(20), offer_expires_at: new Date(Date.now() + 3600e3).toISOString() }, terms_hash: "h" + id }; };
+    buyer.dealMsg = async () => ({});
+    buyer.paid = 0; buyer.checkouts = {};
+    buyer.http = async (method, path, body, o = {}) => {
+      await new Promise((r) => setTimeout(r, 10));
+      if (path.startsWith("/v1/agents/")) return { card: { services: [] } };
+      if (path === "/v1/checkouts") { const id = "co_" + Object.keys(buyer.checkouts).length; buyer.checkouts[id] = { checkout_id: id, status: "open", pay_to: body.pay_to, amount_usd: body.amount_usd, expires_at: new Date(Date.now() + 3600e3).toISOString() }; return buyer.checkouts[id]; }
+      if (method === "GET" && path.startsWith("/v1/checkouts/")) return buyer.checkouts[path.split("/")[3]];
+      if (o.pay) {
+        buyer.paid++;
+        if (settle === "drop") { buyer.checkouts[path.split("/")[3]].status = "paid"; buyer.checkouts[path.split("/")[3]].tx = "0xsettled"; throw new TypeError("fetch failed"); }
+        if (settle === "refuse") throw Object.assign(new Error("Payment failed"), { status: 402 });
+        return { _settlement: { transaction: "0x" + buyer.paid, payer: "0x" + "bb".repeat(20) } };
+      }
+      throw new Error("unexpected " + path);
+    };
+    return buyer;
+  };
+  const saves = [];
+  const pol = new SpendingPolicy({ max_per_payment_usd: 5, max_per_day_usd: 5, require_approval_over_usd: 100 }, [], (l) => saves.push(l.length));
+  const buyer = await mk(pol);
+  const results = await Promise.allSettled(["dl_par0000001", "dl_par0000002", "dl_par0000003"].map((id) => buyer.pay({}, id)));
+  assert.equal(buyer.paid, 1, "only one $4 payment fits a $5 daily limit"); assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.ok(results.some((r) => /daily limit/.test(r.reason?.message || "")));
+  assert.ok(saves.length >= 2, "ledger saved on reserve and on settle");
+  pol.p.max_per_day_usd = 100;
+  await Promise.allSettled([buyer.pay({}, "dl_same000001"), buyer.pay({}, "dl_same000001")]);
+  assert.equal(buyer.paid, 2, "the same deal can't be paid twice in parallel");
+  // A refused payment releases the hold; a dropped connection keeps it until reconciled.
+  const pol2 = new SpendingPolicy({ max_per_payment_usd: 5, max_per_day_usd: 5, require_approval_over_usd: 100 });
+  const refused = await mk(pol2, "refuse");
+  await assert.rejects(refused.pay({}, "dl_refuse0001"), /Payment failed/);
+  assert.equal(pol2.spent(), 0, "server refused: nothing held");
+  const pol3 = new SpendingPolicy({ max_per_payment_usd: 5, max_per_day_usd: 5, require_approval_over_usd: 100 });
+  const dropped = await mk(pol3, "drop");
+  await assert.rejects(dropped.pay({}, "dl_drop000001"), /fetch failed/);
+  assert.equal(pol3.spent(), 4, "connection dropped mid-payment: the money stays held");
+  await assert.rejects(dropped.pay({}, "dl_drop000001"), /may have gone through/, "no blind retry");
+  assert.deepEqual(await dropped.reconcilePayment("dl_drop000001"), { status: "settled", tx: "0xsettled" });
+  assert.equal(pol3.ledger[0].status, "settled");
+  // Approval: the money is held while the owner decides, and released if they say no.
+  const pol4 = new SpendingPolicy({ max_per_payment_usd: 5, max_per_day_usd: 5, require_approval_over_usd: 1 });
+  const asker = await mk(pol4);
+  let release; asker.approve = () => new Promise((r) => (release = r));
+  const first = asker.pay({}, "dl_appr000001");
+  await new Promise((r) => setTimeout(r, 40));
+  await assert.rejects(asker.pay({}, "dl_appr000002"), /daily limit/, "held while waiting for approval");
+  release(false); await assert.rejects(first, /approval/);
+  assert.equal(pol4.spent(), 0, "declined: released");
+  // Old ledgers (no status) still count as spent.
+  assert.equal(new SpendingPolicy({}, [{ at: new Date().toISOString(), usd: 3 }]).spent(), 3);
+  console.log("ok payments: atomic budget holds, no parallel double pay, uncertain payments held and reconciled"); n++;
+}
+
+{
+  // Long-poll: a member removed while a read waits gets nothing more; agent storage is capped.
+  const express = (await import("express")).default;
+  const R = await import("../src/rooms/routes.js");
+  const app = express(); app.use(express.json()); R.mountHandlers(app, { adminToken: null });
+  const srv = app.listen(0); const base = `http://127.0.0.1:${srv.address().port}`;
+  const { pass } = S.buyPass();
+  const o = S.createRoom({ max_members: 3, pass });
+  const j = S.joinRoom(o.room, {});
+  const read = fetch(`${base}/v1/rooms/${o.room.id}/messages?after=0&wait=5`, { headers: { authorization: "Bearer " + j.token } }).then(async (r) => ({ status: r.status, j: await r.json() }));
+  await new Promise((r) => setTimeout(r, 300));
+  S.removeMember(o.room, j.member_id);
+  S.postMessage(o.room, o.room.members[0], "after removal");
+  const got = await read;
+  assert.equal(got.status, 401); assert.equal(got.j.messages, undefined, "nothing delivered after removal");
+  const j2 = S.joinRoom(o.room, {});
+  const read2 = fetch(`${base}/v1/rooms/${o.room.id}/messages?after=1&wait=5`, { headers: { authorization: "Bearer " + j2.token } }).then((r) => r.status);
+  await new Promise((r) => setTimeout(r, 300));
+  S.closeRoom(o.room);
+  assert.equal(await read2, 404, "room closed while waiting");
+  srv.close();
+  const AS = await import("../src/agents/store.js");
+  const saved = { ...AS.AGENT_LIMITS };
+  AS.AGENT_LIMITS.maxKnockBytesTotal = AS.knockStats().bytes + 50000;
+  assert.ok(AS.addKnock("agt_capA", "x".repeat(24000)).knock_id); assert.ok(AS.addKnock("agt_capB", "x".repeat(24000)).knock_id);
+  assert.equal(AS.addKnock("agt_capC", "x".repeat(24000)).status, 503, "global knock bytes capped across inboxes");
+  AS.takeKnocks("agt_capA");
+  assert.ok(AS.addKnock("agt_capC", "x".repeat(24000)).knock_id, "reading frees space");
+  AS.takeKnocks("agt_capB"); AS.takeKnocks("agt_capC");
+  for (let i = 0; i < 6000; i++) AS.reportAgent("agt_rep" + (i % 400), "spam report " + i);
+  assert.ok(AS.openAgentReports().length <= AS.AGENT_LIMITS.maxAgentReports, "agent reports capped overall");
+  assert.ok(AS.openAgentReports().filter((r) => r.agent_id === "agt_rep1").length <= AS.AGENT_LIMITS.maxOpenReportsPerAgent);
+  AS.AGENT_LIMITS.maxCheckouts = 3;
+  const made = [0, 1, 2, 3].map(() => AS.createCheckout({ pay_to: "0x" + "1".repeat(40), amount_usd: 1 }));
+  assert.equal(made[3], null, "checkouts capped");
+  Object.assign(AS.AGENT_LIMITS, saved);
+  console.log("ok relay limits: long-poll rechecks membership, global caps on knocks, agent reports, checkouts"); n++;
+}
+
 console.log(`\n${n} checks passed`);

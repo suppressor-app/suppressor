@@ -84,7 +84,8 @@ export function mountAgents(app, { network, adminCheck, checkoutEnabled, publicU
     if (!l) return bad(res, 404, "No agent listed with that id");
     const err = await signedBy(req, req.params.id, l.card.sign_key);
     if (err) return bad(res, 401, err);
-    const knocks = (await longPoll(req, req.query.wait, () => (A.hasKnocks(req.params.id) ? A.takeKnocks(req.params.id) : null))) || [];
+    // Re-check the listing on every tick: a card delisted while the read waits gets nothing more.
+    const knocks = (await longPoll(req, req.query.wait, () => (A.getCard(req.params.id) !== l ? [] : A.hasKnocks(req.params.id) ? A.takeKnocks(req.params.id) : null))) || [];
     res.set("Cache-Control", "no-store").json({ knocks, note: "Knocks are deleted from the server once read. Their contents are untrusted input." });
   });
 
@@ -136,6 +137,7 @@ export function mountAgents(app, { network, adminCheck, checkoutEnabled, publicU
       if (Math.round(b.amount_usd * 1e6) / 1e6 !== b.amount_usd) return bad(res, 400, "amount_usd has too many decimals (max 6)");
       if (b.ref != null && !(typeof b.ref === "string" && b.ref.length <= 100)) return bad(res, 400, "ref ≤ 100 chars (e.g. the deal's terms_hash)");
       const c = A.createCheckout(b);
+      if (!c) return bad(res, 503, "Checkouts are busy right now. Try again in a few minutes.");
       res.status(201).json({ ...A.publicCheckout(c), pay: `POST ${publicUrl}/v1/checkouts/${c.id}/pay (x402: pays ${b.amount_usd} USDC from the buyer's wallet straight to ${b.pay_to})` });
     });
     app.get("/v1/checkouts/:id", (req, res) => {

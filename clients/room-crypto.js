@@ -93,18 +93,85 @@ const hybridAad = (roomId, toMember) => enc.encode(`suppressor-v2\n${roomId}\n${
 // Length-hiding padding: [4-byte big-endian length][UTF-8 text][random bytes] up to a bucket
 // of 256, 1024, 4096, 8192, 16384… bytes (doubling from 4096 on).
 export function padBucket(n) { let b = 256; while (b < n) b *= b < 4096 ? 4 : 2; return b; }
-function pad(text) {
+// getRandomValues fills at most 65,536 bytes per call (QuotaExceededError above that), so fill
+// large buffers in chunks.
+function fillRandom(buf) {
+  for (let i = 0; i < buf.length; i += 65536) globalThis.crypto.getRandomValues(buf.subarray(i, Math.min(buf.length, i + 65536)));
+  return buf;
+}
+
+// Replay protection (v1.3). Right after the text, inside the encrypted and authenticated
+// plaintext, the sender writes a 32-byte trailer:
+//   "SPR1" (4) | message id (16 random bytes) | sender counter (8, big-endian) | 0 (4)
+// The counter is the sender's clock in microseconds, bumped to stay strictly increasing, so it
+// needs no saved state and doubles as an authenticated send time. The relay can't change it
+// (AES-GCM), so a replayed message carries the same counter and is caught by ReplayGuard. Older
+// readers ignore it: to them it is part of the random padding after the text.
+const TRAILER_MAGIC = [0x53, 0x50, 0x52, 0x31]; // "SPR1"
+const TRAILER_BYTES = 32;
+function nextCounter(me) {
+  const c = Math.max((me._ctr || 0) + 1, Date.now() * 1000);
+  Object.defineProperty(me, "_ctr", { value: c, writable: true, enumerable: false, configurable: true }); // not saved with the identity
+  return c;
+}
+function pad(text, meta) {
   const t = enc.encode(text);
-  const out = new Uint8Array(padBucket(t.length + 4));
-  globalThis.crypto.getRandomValues(out);
-  new DataView(out.buffer).setUint32(0, t.length);
+  const out = fillRandom(new Uint8Array(padBucket(t.length + 4 + (meta ? TRAILER_BYTES : 0))));
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, t.length);
   out.set(t, 4);
+  if (meta) {
+    const o = 4 + t.length;
+    out.set(TRAILER_MAGIC, o);
+    out.set(meta.id, o + 4);
+    dv.setBigUint64(o + 20, BigInt(meta.counter));
+    dv.setUint32(o + 28, 0);
+  }
   return out;
 }
 function unpad(bytes) {
-  const n = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const n = dv.getUint32(0);
   if (n > bytes.length - 4) throw new Error("bad padding");
-  return dec.decode(bytes.subarray(4, 4 + n));
+  const text = dec.decode(bytes.subarray(4, 4 + n));
+  const o = 4 + n;
+  let meta = null;
+  if (bytes.length >= o + TRAILER_BYTES && TRAILER_MAGIC.every((b, i) => bytes[o + i] === b) && dv.getUint32(o + 28) === 0) {
+    const counter = Number(dv.getBigUint64(o + 20));
+    meta = { msg_id: b64(bytes.slice(o + 4, o + 20)), counter, sent_at: new Date(Math.floor(counter / 1000)).toISOString() };
+  }
+  return { text, meta };
+}
+
+// Tracks which messages each sender has already delivered. Keep one per room and save its
+// state() with the room (it's small) so replays are caught across restarts too.
+// check(fromKey, meta, seq) -> null if the message is fine, or the reason it's refused.
+// seq is the relay's sequence number: reading the same message at the same seq again (a client
+// re-reading its history) is fine; the same counter under a different seq is a replay.
+export class ReplayGuard {
+  constructor(saved = {}) { this.s = saved && typeof saved === "object" ? saved : {}; }
+  check(fromKey, meta, seq) {
+    const st = this.s[fromKey];
+    if (!meta) {
+      // Once a sender has sent protected messages, a later unprotected one is suspect: it could be
+      // one of their old (pre-upgrade) messages replayed under a new seq.
+      return st && !(seq < st.since) ? "This sender's messages carry replay protection, but this one doesn't: possibly an old message replayed." : null;
+    }
+    if (st) {
+      const hit = st.seen.find((x) => x[0] === meta.counter);
+      if (hit) return hit[1] === seq ? null : "Replayed message (already received).";
+      if (meta.counter <= st.floor) return "Replayed message (already received).";
+    }
+    // Remember the last 256 counters per sender so slightly out-of-order delivery still works;
+    // anything at or below the oldest forgotten counter (floor) is refused.
+    const next = st || { since: seq ?? 0, floor: 0, seen: [] };
+    if (seq != null && seq < next.since) next.since = seq;
+    next.seen.push([meta.counter, seq ?? null]);
+    if (next.seen.length > 256) { next.seen.sort((a, b) => a[0] - b[0]); next.floor = next.seen.shift()[0]; }
+    this.s[fromKey] = next;
+    return null;
+  }
+  state() { return this.s; }
 }
 
 // ---- seal / open -------------------------------------------------------------------------------
@@ -119,7 +186,8 @@ export async function sealDetailed(roomId, me, members, plaintext, opts = {}) {
   const others = members.filter((m) => m.public_key && m.public_key !== me.publicKey && m.member_id !== opts.myMemberId);
   if (!others.length) throw new Error("No other member has published a public key yet.");
   const to = {}, skipped = [];
-  const padded = pad(plaintext);
+  const msgId = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  const padded = pad(plaintext, { id: msgId, counter: nextCounter(me) });
   let hybrid = false;
   for (const m of members) {
     if (!m.public_key) continue;
@@ -157,7 +225,7 @@ export async function sealDetailed(roomId, me, members, plaintext, opts = {}) {
   const body = JSON.stringify(hybrid
     ? { v: 2, alg: "X25519+MLKEM768-HKDF-AES256GCM", pad: 1, from_key: me.publicKey, to }
     : { v: 1, alg: "X25519-HKDF-AES256GCM", pad: 1, from_key: me.publicKey, to });
-  return { body, skipped, post_quantum: hybrid && Object.values(to).every((b) => b.kem) };
+  return { body, skipped, post_quantum: hybrid && Object.values(to).every((b) => b.kem), msg_id: b64(msgId) };
 }
 export async function seal(roomId, me, members, plaintext, opts) {
   return (await sealDetailed(roomId, me, members, plaintext, opts)).body;
@@ -188,9 +256,11 @@ export async function openDetailed(roomId, me, myMemberId, body, expectedFromKey
     const key = await classicalKey(roomId, me.privateKeyPkcs8, env.from_key);
     pt = new Uint8Array(await subtle.decrypt({ name: "AES-GCM", iv: unb64(box.iv) }, key, unb64(box.ct)));
   }
-  const text = env.pad ? unpad(pt) : dec.decode(pt); // unpadded = older clients
+  const { text, meta } = env.pad ? unpad(pt) : { text: dec.decode(pt), meta: null }; // unpadded = older clients
   pt.fill(0);
-  return { text, post_quantum: !!box.kem };
+  // meta: { msg_id, counter, sent_at } from inside the encryption (null for older senders).
+  // Pass it to a ReplayGuard to refuse replays.
+  return { text, post_quantum: !!box.kem, from_key: env.from_key, meta };
 }
 export async function open(roomId, me, myMemberId, body, expectedFromKey) {
   const r = await openDetailed(roomId, me, myMemberId, body, expectedFromKey);
@@ -207,7 +277,7 @@ export async function encryptBlob(bytes) {
   const raw = new Uint8Array(bytes);
   const size = Math.ceil((raw.length + 4) / BLOB_STEP) * BLOB_STEP;
   const padded = new Uint8Array(size);
-  for (let i = 0; i < size; i += 65536) globalThis.crypto.getRandomValues(padded.subarray(i, Math.min(size, i + 65536)));
+  fillRandom(padded);
   new DataView(padded.buffer).setUint32(0, raw.length);
   padded.set(raw, 4);
   const keyBytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
@@ -239,22 +309,37 @@ export const pinKey = (p) => normPin(p)?.k;
 // Returns the updated pins and: added (new members), changed (key swapped or PQ key removed),
 // upgraded (a pinned member added a PQ key for the first time; pinned automatically, since a
 // hybrid key can only add protection, never remove the X25519 layer), gone (pinned members no
-// longer listed, e.g. they left).
+// longer listed, e.g. they left), returned (a member who had left is listed again, same keys).
+//
+// Pins are never forgotten. A member who leaves keeps their pin, marked left: true. Otherwise a
+// dishonest relay could say "B left", then list B again with its own keys, and B would look new
+// and be trusted without a key-change alert. A returning member id with different keys is a key
+// change like any other; with the same keys it is reported in `returned`.
 export function checkPins(pins = {}, members = []) {
-  const next = {}, added = [], changed = [], upgraded = [];
+  const next = {}, added = [], changed = [], upgraded = [], returned = [];
   for (const [id, p] of Object.entries(pins)) next[id] = normPin(p);
   for (const m of members) {
     if (!m.public_key) continue;
     const shown = { k: m.public_key, pq: m.pq_key || null };
     const pin = next[m.member_id];
     if (!pin) { next[m.member_id] = shown; added.push(m.member_id); }
-    else if (pin.k !== shown.k || (pin.pq && pin.pq !== shown.pq)) changed.push({ member_id: m.member_id, pinned: pin, shown, downgrade: pin.k === shown.k && !shown.pq });
-    else if (!pin.pq && shown.pq) { next[m.member_id] = shown; upgraded.push(m.member_id); }
+    else if (pin.k !== shown.k || (pin.pq && pin.pq !== shown.pq)) changed.push({ member_id: m.member_id, pinned: pin, shown, downgrade: pin.k === shown.k && !shown.pq, returning: !!pin.left });
+    else {
+      if (pin.left) { const { left, ...rest } = pin; next[m.member_id] = rest; returned.push(m.member_id); }
+      if (!pin.pq && shown.pq) { next[m.member_id] = shown; upgraded.push(m.member_id); }
+    }
   }
   const listed = new Set(members.map((m) => m.member_id));
-  const gone = Object.keys(next).filter((id) => !listed.has(id));
-  return { pins: next, added, changed, upgraded, gone };
+  const gone = [];
+  for (const [id, pin] of Object.entries(next)) {
+    if (listed.has(id) || pin.left) continue;
+    next[id] = { ...pin, left: true };
+    gone.push(id);
+  }
+  return { pins: next, added, changed, upgraded, gone, returned };
 }
+// Accept the keys a key-change alert showed (after comparing safety codes). Clears `left`.
+export const acceptShownKey = (pins, change) => { pins[change.member_id] = { k: change.shown.k, pq: change.shown.pq || null }; };
 
 // Post-quantum status of a room: protected only when every member with a key has an ML-KEM key.
 export function roomPqStatus(members = []) {

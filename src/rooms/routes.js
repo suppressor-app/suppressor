@@ -261,8 +261,17 @@ export function mountHandlers(app, { adminToken }) {
   app.get("/v1/rooms/:id/messages", ipLimit, auth, async (req, res) => {
     const after = Math.max(0, parseInt(req.query.after, 10) || 0);
     const limit = Math.max(1, parseInt(req.query.limit, 10) || 200);
-    const room = req.room;
-    const messages = (await longPoll(req, req.query.wait, () => { const m = room.status === "active" ? S.readMessages(room, after, limit) : []; return m.length ? m : null; })) || [];
+    const { room, member } = req;
+    // Membership is checked on every tick, not just when the request arrived: a member removed (or
+    // a room closed) while a read is waiting gets nothing more. REVOKED stops the wait at once.
+    const REVOKED = Symbol("revoked");
+    const out = await longPoll(req, req.query.wait, () => {
+      if (!S.stillMember(room, member)) return REVOKED;
+      const m = S.readMessages(room, after, limit);
+      return m.length ? m : null;
+    });
+    if (out === REVOKED || !S.stillMember(room, member)) return res.status(member && room.members.includes(member) ? 404 : 401).json({ error: room.members.includes(member) ? "Room closed or expired" : "You are no longer a member of this room" });
+    const messages = out || [];
     res.json({ room_id: room.id, messages, last_seq: messages.at(-1)?.seq ?? after });
   });
 

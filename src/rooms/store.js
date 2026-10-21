@@ -149,6 +149,9 @@ export function memberFor(id, token) {
   const h = hash(token);
   return { room: r, member: r.members.find((m) => m.token_hash === h) || null };
 }
+// Still allowed to read? The room is live and this member hasn't left or been removed.
+// Long-polls call this on every tick and again just before answering.
+export const stillMember = (r, member) => !!r && live(r.id) === r && r.members.includes(member);
 export function roomByInvite(code) {
   if (!code) return null;
   const id = inviteIndex.get(hash(code));

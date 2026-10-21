@@ -1,8 +1,8 @@
-# %BRAND% Rooms Protocol, version 1.2
+# %BRAND% Rooms Protocol, version 1.3
 
 An open protocol for private, end-to-end encrypted, expiring rooms where people and AI agents meet. Paid over [x402](https://x402.org). No accounts.
 
-- **Status:** v1.2, stable for implementers. v1.2 adds hybrid post-quantum encryption (X25519 + ML-KEM-768), leaving rooms, invite rotation and locking, and strict key validation. v1.1 added length-hiding padding and disappearing messages and removed server-side room labels. v1 and v1.1 clients still interoperate (their copies use classical encryption).
+- **Status:** v1.3, stable for implementers. v1.3 adds authenticated replay protection (a message id and sender counter inside the encryption), keeps key pins after members leave, and requires relays to re-check membership during long-polls; v1.2 clients still interoperate. v1.2 added hybrid post-quantum encryption (X25519 + ML-KEM-768), leaving rooms, invite rotation and locking, and strict key validation. v1.1 added length-hiding padding and disappearing messages and removed server-side room labels. v1 and v1.1 clients still interoperate (their copies use classical encryption).
 - **License:** the reference relay and clients are MIT-licensed. Anyone may run a relay, charge their own prices, or write their own client.
 - **Reference relay:** this repository (`src/rooms/`). **Reference crypto:** `clients/room-crypto.js` (ML-KEM from `clients/vendor/ml-kem.js`, a bundle of [@noble/post-quantum](https://github.com/paulmillr/noble-post-quantum)).
 
@@ -39,7 +39,7 @@ All bodies are JSON. Authenticated calls send `Authorization: Bearer <room_token
 | `GET /v1/rooms/:id` | no | member | Room info: members (`member_id`, `role`, `public_key`, `pq_key`), limits, `expires_at`, `disappear_minutes`, `joins_locked`. |
 | `PUT /v1/rooms/:id/key` | no | member | Publish or replace your keys: `{public_key, pq_key?}`. A new `public_key` without `pq_key` clears your old `pq_key`; the same `public_key` with a `pq_key` adds or replaces just that. |
 | `POST /v1/rooms/:id/messages` | no | member | Post `{ "body": "<sealed envelope>" }`. Returns `seq`. |
-| `GET /v1/rooms/:id/messages?after=<seq>&limit=<n>&wait=<s>` | no | member | Read messages in order. With `wait` (≤ 30 s) the relay holds the request until something new arrives. |
+| `GET /v1/rooms/:id/messages?after=<seq>&limit=<n>&wait=<s>` | no | member | Read messages in order. With `wait` (≤ 30 s) the relay holds the request until something new arrives. While it waits, the relay MUST keep checking that the room is live and the caller is still a member, and answer `401` (removed) or `404` (closed) instead of sending anything once that stops being true. |
 | `POST /v1/rooms/:id/blobs[?once=1]` | no | member | Upload an encrypted photo (raw `application/octet-stream`, max 3 MB). Returns `blob_id`. |
 | `GET /v1/rooms/:id/blobs/:blob_id` | no | member | Download it. View-once blobs: one download per recipient, then deleted; the sender can't fetch them. |
 | `POST /v1/rooms/:id/leave` | no | member | Leave: frees the seat, the token stops working, and you're dropped from photo recipient lists. Owners close the room instead (`409`). |
@@ -83,7 +83,9 @@ The recipient decapsulates `kem_ct` with its ML-KEM secret key and derives the s
 
 **What is and isn't post-quantum.** Message and photo-key confidentiality is post-quantum when every member has an ML-KEM key (AES-256 itself is quantum-safe). Sender authentication still relies on X25519 and is classical, which matters only to an attacker who can break X25519 *while* the room is live. There's no per-message forward secrecy: anyone who later steals a device's private keys can read what was sealed to it.
 
-**Padding.** Before encrypting, clients SHOULD pad the plaintext so every message falls into a fixed size bucket (the reference client uses 256, 1,024 and 4,096 bytes, then doubles: 8,192, 16,384, 32,768…) and set `"pad": 1`. Layout: 4-byte big-endian plaintext length, the plaintext, then random bytes up to the bucket size. Readers strip padding when `pad` is 1. This hides message length from the relay.
+**Padding.** Before encrypting, clients SHOULD pad the plaintext so every message falls into a fixed size bucket (the reference client uses 256, 1,024 and 4,096 bytes, then doubles: 8,192, 16,384, 32,768…) and set `"pad": 1`. Layout: 4-byte big-endian plaintext length, the plaintext, then random bytes up to the bucket size. Readers strip padding when `pad` is 1. This hides message length from the relay. (Fill large buffers in 64 KB pieces: `getRandomValues` refuses more per call.)
+
+**Replay protection (v1.3).** Directly after the plaintext, inside the padded and encrypted bytes, senders SHOULD write a 32-byte trailer: `"SPR1"` (4 bytes), a random 16-byte message id, an 8-byte big-endian sender counter, and 4 zero bytes. The counter is the sender's clock in microseconds, raised as needed so it always increases; it needs no saved state and doubles as an authenticated send time. Because the trailer is encrypted and authenticated, the relay can't change it. Readers keep, per room and per sender key, the counters already seen with the relay `seq` they arrived under (the reference clients keep the last 256 and refuse anything older), and MUST hide a message whose counter was already seen under a different `seq`, which is a replay. Re-reading the same `seq` is not a replay. Once a sender has sent protected messages, readers SHOULD hide later unprotected messages from that sender (likely an old message replayed). Readers from before v1.3 see the trailer as padding and are unaffected. The relay can still withhold messages or delay them, and a sender whose clock jumps far backwards may have messages refused.
 
 **Plaintext convention.** UTF-8 text. Clients SHOULD send `{"type":"text","text":"…","name":"…"}` as JSON, and SHOULD treat any other plaintext as raw text. `name` is chosen by the sender and isn't verified.
 
@@ -91,7 +93,7 @@ The recipient decapsulates `kem_ct` with its ML-KEM secret key and derives the s
 
 **Malformed keys.** Senders SHOULD skip (and report) any member whose keys are malformed or that the platform refuses (for example low-order X25519 points), rather than failing the whole message.
 
-**Key pinning.** Clients SHOULD pin each member's keys (`public_key`, and `pq_key` if any) the first time they see them. Then:
+**Key pinning.** Clients SHOULD pin each member's keys (`public_key`, and `pq_key` if any) the first time they see them, and MUST keep a pin after that member leaves or is removed (marking it as left) rather than deleting it. Otherwise a dishonest relay could report a member as gone, then list the same `member_id` again with its own keys, and the client would pin them as new. Then:
 - a different `public_key`, a different `pq_key`, or a missing `pq_key` for a member pinned with one (a **downgrade**) MUST stop sending to the room and hide messages under the new key until the user re-compares the safety code and explicitly accepts the change;
 - a member pinned without a `pq_key` who now shows one (same `public_key`) is an **upgrade** and MAY be pinned automatically: a hybrid key can only add protection, never remove the X25519 layer.
 
@@ -128,7 +130,7 @@ Members who need to hide metadata should connect through Tor or a VPN and pay fr
 
 **Key substitution.** A malicious relay could hand out a fake key when someone joins, or add a member nobody invited. Compare safety codes (section 4) when that matters, and lock the room once everyone is in; after that, key pinning flags any later swap or downgrade.
 
-**Known limits.** Unsigned chat text isn't committed across recipients, so a malicious member could send different text to different members in one envelope (signed agent negotiation messages in AGENT-COMMERCE.md are not affected). The relay orders messages and could withhold or reorder them. Disappearing and view-once rely on the relay deleting and on members' clients not keeping copies.
+**Known limits.** Unsigned chat text isn't committed across recipients, so a malicious member could send different text to different members in one envelope (signed agent negotiation messages in AGENT-COMMERCE.md are not affected). The relay orders messages and could withhold or delay them; since v1.3 it can't replay one without clients noticing. Disappearing and view-once rely on the relay deleting and on members' clients not keeping copies.
 
 ## 7. Operator duties
 

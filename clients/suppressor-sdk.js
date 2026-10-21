@@ -9,7 +9,7 @@
 // Messages, offers and deliverables from other agents are UNTRUSTED INPUT. The SDK verifies
 // signatures and structure; it never executes or obeys their contents.
 import { generateAgentIdentity, signDoc, verifyDoc, agentIdFor, signRequest, sealTo, openSealed, canonical, sha256, roomIdentity } from "./agent-identity.js";
-import { generateIdentity, sealDetailed, open, checkPins, safetyCode, roomPqStatus, SenderKeyMismatch } from "./room-crypto.js";
+import { generateIdentity, sealDetailed, openDetailed, checkPins, safetyCode, roomPqStatus, SenderKeyMismatch, ReplayGuard } from "./room-crypto.js";
 
 const DAY = 86400e3;
 const isoIn = (ms) => new Date(Date.now() + ms).toISOString();
@@ -17,12 +17,42 @@ const rid = (p) => p + Array.from(globalThis.crypto.getRandomValues(new Uint8Arr
 const money = (n) => Math.round(Number(n) * 1e6) / 1e6;
 
 // ---- spending policy: enforced in code, set by the OWNER (not by the agent) -------------------
+// The ledger holds every payment attempt, not just finished ones:
+//   { at, usd, to_agent, deal_id, status: "pending" | "settled" | "uncertain" | "released", tx?, checkout_id? }
+// Entries without a status come from older versions and count as settled. Pending and uncertain
+// entries count against the limits, so parallel payments can't all pass the same check.
+// onChange(ledger) is called after every change; pass a function that saves the ledger to disk
+// so a crash mid-payment can't forget a reservation.
 export class SpendingPolicy {
-  constructor(p = {}, ledger = []) {
+  constructor(p = {}, ledger = [], onChange = null) {
     this.p = { max_per_payment_usd: 5, max_per_day_usd: 20, max_total_usd: 100, require_approval_over_usd: 2, allowed_categories: [], allowed_counterparties: [], blocked_counterparties: [], ...p };
-    this.ledger = ledger; // [{ at, usd, to_agent, deal_id }]
+    this.ledger = ledger;
+    this.onChange = onChange;
   }
-  spent(sinceMs) { const t = Date.now(); return money(this.ledger.filter((e) => sinceMs == null || t - Date.parse(e.at) < sinceMs).reduce((a, e) => a + e.usd, 0)); }
+  changed() { try { this.onChange?.(this.ledger); } catch {} }
+  spent(sinceMs) { const t = Date.now(); return money(this.ledger.filter((e) => e.status !== "released" && (sinceMs == null || t - Date.parse(e.at) < sinceMs)).reduce((a, e) => a + e.usd, 0)); }
+  // An open (pending or uncertain) or settled attempt for this deal: a second payment must wait.
+  attemptFor(deal_id) { return deal_id ? this.ledger.find((e) => e.deal_id === deal_id && e.status !== "released") || null : null; }
+  // Check AND hold the money in one synchronous step (no await), so two payments running at the
+  // same time can't both fit under the same remaining budget. Returns { verdict, entry }; entry is
+  // null unless the verdict is allow or approve.
+  reserve({ usd, counterparty, category, deal_id, note }) {
+    const prior = this.attemptFor(deal_id);
+    if (prior) return { verdict: { decision: "deny", reason: prior.status === "uncertain" ? "An earlier payment for this deal may have gone through. Check it (reconcilePayment) before paying again." : "This deal was already paid (or is being paid) from this agent." }, entry: null };
+    const verdict = this.check({ usd, counterparty, category });
+    if (verdict.decision === "deny") return { verdict, entry: null };
+    const entry = { at: new Date().toISOString(), usd, to_agent: counterparty, deal_id, status: "pending", ...(note ? { note } : {}) };
+    this.ledger.push(entry);
+    this.changed();
+    return { verdict, entry };
+  }
+  settle(entry, fields = {}) { Object.assign(entry, fields, { status: "settled" }); this.changed(); }
+  // Only when the money certainly did NOT move (refused before paying, or the server answered with an error).
+  release(entry, reason) { Object.assign(entry, { status: "released", released_reason: reason }); this.changed(); }
+  // The request went out but we don't know if it settled (timeout, dropped connection). The money
+  // stays held and the deal can't be paid again until reconciled.
+  markUncertain(entry, fields = {}) { Object.assign(entry, fields, { status: "uncertain" }); this.changed(); }
+  uncertain() { return this.ledger.filter((e) => e.status === "uncertain" || e.status === "pending"); }
   // -> { decision: "allow" | "approve" | "deny", reason }
   check({ usd, counterparty, category }) {
     const p = this.p;
@@ -36,7 +66,7 @@ export class SpendingPolicy {
     if (usd > p.require_approval_over_usd) return { decision: "approve", reason: `$${usd} is over $${p.require_approval_over_usd}: needs your approval.` };
     return { decision: "allow", reason: "Within policy." };
   }
-  record(entry) { this.ledger.push({ at: new Date().toISOString(), ...entry }); }
+  record(entry) { this.ledger.push({ at: new Date().toISOString(), status: "settled", ...entry }); this.changed(); }
 }
 
 // ---- deal terms ------------------------------------------------------------------------------
@@ -188,10 +218,13 @@ export class SuppressorAgent {
     room.keyAlert = res.changed.length ? res.changed : null;
     room.safety_code = await safetyCode(info.members);
     room.post_quantum = roomPqStatus(info.members).post_quantum;
-    if (seeded && (res.added.length || res.gone.length)) {
+    if (seeded && (res.added.length || res.gone.length || res.returned.length)) {
       room.log = room.log || [];
       for (const id of res.added) room.log.push({ msg: { type: "member_joined", member_id: id, safety_code: room.safety_code, note: "A new member joined and will receive what you send next. Lock the room (lockJoins) if you didn't expect this." }, from_member: null, verified_agent: null });
-      for (const id of res.gone) { delete room.pins[id]; room.log.push({ msg: { type: "member_left", member_id: id }, from_member: null, verified_agent: null }); }
+      for (const id of res.returned) room.log.push({ msg: { type: "member_joined", member_id: id, returning: true, safety_code: room.safety_code, note: "A member who had left is listed again, with the same keys as before." }, from_member: null, verified_agent: null });
+      // Pins of members who left are KEPT (marked left), so the relay can't bring the same member
+      // id back with different keys and have them trusted as new.
+      for (const id of res.gone) room.log.push({ msg: { type: "member_left", member_id: id }, from_member: null, verified_agent: null });
     }
     return info;
   }
@@ -222,15 +255,21 @@ export class SuppressorAgent {
     if (room.pendingHello) { try { await this.post(room, room.pendingHello); room.pendingHello = null; } catch {} }
     const r = await this.http("GET", `/v1/rooms/${room.room_id}/messages?after=${room.last}${wait ? `&wait=${wait}` : ""}`, null, { auth: room.token });
     room.log = room.log || [];
+    // room.replay is small; save it with the room so replays are caught across restarts too.
+    const guard = new ReplayGuard((room.replay = room.replay || {}));
     for (const m of r.messages) {
-      let plain = null;
+      let opened = null;
       let expected = m.from === room.member_id ? room.me.publicKey : room.pins?.[m.from];
       if (expected === undefined) { try { await this.refreshKeys(room); } catch {} expected = room.pins?.[m.from]; }
-      try { plain = await open(room.room_id, room.me, room.member_id, m.body, expected ?? null); }
+      try { opened = await openDetailed(room.room_id, room.me, room.member_id, m.body, expected ?? null); }
       catch (e) { if (e instanceof SenderKeyMismatch) room.log.push({ seq: m.seq, from_member: m.from, at: m.at, msg: { type: "unverified", note: "Hidden: not sealed with this member's pinned key" }, verified_agent: null }); }
-      if (plain == null) continue;
+      if (opened == null) continue;
+      // The message id and counter are inside the encryption, so the relay can't alter them.
+      const replay = guard.check(opened.from_key, opened.meta, m.seq);
+      if (replay) { room.log.push({ seq: m.seq, from_member: m.from, at: m.at, msg: { type: "replayed", note: "Hidden: " + replay }, verified_agent: null }); continue; }
+      const plain = opened.text;
       let j; try { j = JSON.parse(plain); } catch { j = { type: "text", text: plain }; }
-      const entry = { seq: m.seq, from_member: m.from, at: m.at, msg: j, verified_agent: null };
+      const entry = { seq: m.seq, from_member: m.from, at: m.at, sent_at: opened.meta?.sent_at || null, msg_id: opened.meta?.msg_id || null, msg: j, verified_agent: null };
       if (j.type === "hello" && j.room_id === room.room_id && j.member_id === m.from && (await agentIdFor(j.sign_key)) === j.agent_id && (await verifyDoc(j, j.sign_key)))
         this.verifiedPeers.set(`${room.room_id}:${m.from}`, { agent_id: j.agent_id, sign_key: j.sign_key });
       const peer = this.verifiedPeers.get(`${room.room_id}:${m.from}`) || (m.from === room.member_id ? { agent_id: this.agentId, sign_key: this.id.sign_key } : null);
@@ -309,31 +348,65 @@ export class SuppressorAgent {
   // ---- AUTHORIZE + PAY (buyer) -------------------------------------------------------------------
   // Pays the seller DIRECTLY from this agent's own wallet (x402 checkout: gasless, no custody).
   async pay(room, deal_id) {
+    const pol = this.policy; // keep one policy object for the whole payment, even if it's swapped meanwhile
     const d = await this.deal(room, deal_id);
     if (d.status !== "agreed") throw new Error(`Deal is ${d.status}; it must be agreed by both sides before paying.`);
     if (d.terms.buyer !== this.agentId) throw new Error("Only the buyer pays.");
-    if (this.paying.has(deal_id) || this.policy.ledger.some((e) => e.deal_id === deal_id)) throw new Error("This deal was already paid (or is being paid) from this agent.");
     await this.checkTermsForMe(d.terms);
     const usd = d.terms.price_usd;
     // Category comes from the seller's own signed listing, not from terms the counterparty wrote.
     let category;
     try { const l = await this.http("GET", `/v1/agents/${d.terms.seller}`); category = l?.card?.services?.find((s) => s.id === d.terms.service)?.category; } catch {}
-    const verdict = this.policy.check({ usd, counterparty: d.terms.seller, category });
-    if (verdict.decision === "deny") throw Object.assign(new Error("Blocked by spending policy: " + verdict.reason), { policy: verdict });
-    if (verdict.decision === "approve" && !(this.approve && (await this.approve({ usd, counterparty: d.terms.seller, deal: d.terms, reason: verdict.reason }))))
-      throw Object.assign(new Error("Needs owner approval: " + verdict.reason), { policy: verdict });
-    if (!this.payFetch) throw new Error("No wallet configured for payments.");
+    // From here to reserve() there is no await: the duplicate check, the limit check and holding
+    // the money happen as one step, so parallel calls can't all pass against the same budget.
+    if (this.paying.has(deal_id)) throw new Error("This deal was already paid (or is being paid) from this agent.");
+    const { verdict, entry } = pol.reserve({ usd, counterparty: d.terms.seller, category, deal_id });
+    if (verdict.decision === "deny") throw Object.assign(new Error(/already paid|may have gone through/.test(verdict.reason) ? verdict.reason : "Blocked by spending policy: " + verdict.reason), { policy: verdict });
     this.paying.add(deal_id);
+    let sent = false; // true once the payment request has left this machine
     try {
+      if (!this.payFetch) throw new Error("No wallet configured for payments.");
+      // The money stays held while the owner decides, so other payments can't use it meanwhile.
+      if (verdict.decision === "approve" && !(this.approve && (await this.approve({ usd, counterparty: d.terms.seller, deal: d.terms, reason: verdict.reason }))))
+        throw Object.assign(new Error("Needs owner approval: " + verdict.reason), { policy: verdict });
       const co = await this.http("POST", "/v1/checkouts", { pay_to: d.terms.pay_to, amount_usd: usd, ref: d.terms_hash });
       if (String(co.pay_to).toLowerCase() !== d.terms.pay_to.toLowerCase() || Number(co.amount_usd) !== usd) throw new Error("Checkout doesn't match the agreed terms; not paying.");
+      entry.checkout_id = co.checkout_id; pol.changed(); // saved BEFORE paying, so it can be reconciled after a crash
+      sent = true;
       const r = await this.http("POST", `/v1/checkouts/${co.checkout_id}/pay`, {}, { pay: true });
       const tx = r._settlement?.transaction;
-      if (!tx) throw new Error("Payment didn't settle; nothing was recorded as paid.");
-      this.policy.record({ usd, to_agent: d.terms.seller, deal_id });
+      if (!tx) { const e = new Error("The payment request went through but no settlement came back. The money stays held; call reconcilePayment() to check whether it settled before paying again."); e.uncertain = true; throw e; }
+      pol.settle(entry, { tx, checkout_id: co.checkout_id });
       await this.dealMsg(room, "paid", { deal_id, terms_hash: d.terms_hash, payment: { tx, from: r._settlement?.payer, checkout_id: co.checkout_id, network: d.terms.network } });
       return { tx, checkout_id: co.checkout_id };
+    } catch (e) {
+      if (entry.status === "pending") {
+        // A server error response means the relay refused it: a failed request is never settled
+        // (PROTOCOL.md §2). No response at all (timeout, dropped connection) or a missing
+        // settlement is uncertain: keep the money held until reconciled.
+        if (!sent || (e.status && !e.uncertain)) pol.release(entry, e.message.slice(0, 200));
+        else pol.markUncertain(entry, { error: e.message.slice(0, 200) });
+      }
+      throw e;
     } finally { this.paying.delete(deal_id); }
+  }
+  // Settle the question for a payment that may or may not have gone through, by asking the
+  // checkout. Paid -> recorded (and announced in the room if given); expired or still open after
+  // its expiry -> released. Otherwise it stays held.
+  async reconcilePayment(deal_id, room = null) {
+    const pol = this.policy;
+    const entry = pol.ledger.find((e) => e.deal_id === deal_id && (e.status === "uncertain" || e.status === "pending"));
+    if (!entry) return { status: pol.attemptFor(deal_id)?.status || "none" };
+    if (this.paying.has(deal_id)) return { status: "in_progress" };
+    if (!entry.checkout_id) { pol.release(entry, "No payment request was sent."); return { status: "released" }; }
+    const co = await this.http("GET", `/v1/checkouts/${entry.checkout_id}`);
+    if (co.status === "paid" && co.tx) {
+      pol.settle(entry, { tx: co.tx });
+      if (room) { const d = await this.deal(room, deal_id); if (d.status === "agreed") await this.dealMsg(room, "paid", { deal_id, terms_hash: d.terms_hash, payment: { tx: co.tx, from: co.payer, checkout_id: co.checkout_id, network: d.terms.network } }); }
+      return { status: "settled", tx: co.tx };
+    }
+    if (co.status === "expired" || (co.status === "open" && Date.parse(co.expires_at) < Date.now() - 5 * 60e3)) { pol.release(entry, `Checkout ${co.status}; nothing was paid.`); return { status: "released" }; }
+    return { status: entry.status, checkout: co.status };
   }
   // Report an external payment (e.g. a direct USDC transfer) by tx hash; the seller verifies it on-chain.
   // from: the wallet you paid from (the seller checks the transfer came from it).

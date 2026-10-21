@@ -4,7 +4,7 @@
 import { wrapFetchWithPaymentFromConfig } from "@x402/fetch";
 import { ExactEvmScheme } from "@x402/evm";
 import { createWalletClient, custom } from "viem";
-import { generateIdentity, upgradeIdentity, seal, open, encryptBlob, decryptBlob, checkPins, safetyCode, roomPqStatus, SenderKeyMismatch } from "../clients/room-crypto.js";
+import { generateIdentity, upgradeIdentity, seal, openDetailed, encryptBlob, decryptBlob, checkPins, safetyCode, roomPqStatus, SenderKeyMismatch, ReplayGuard } from "../clients/room-crypto.js";
 
 const $ = (s) => document.querySelector(s);
 const show = (id) => document.querySelectorAll("[data-view]").forEach((el) => (el.hidden = el.dataset.view !== id));
@@ -386,10 +386,11 @@ function verifyKeys(info) {
   if (!creds.pins) creds.pins = { [creds.member_id]: { k: creds.me.publicKey, pq: creds.me.pqPublicKey || null } };
   const res = checkPins(creds.pins, info.members);
   creds.pins = res.pins;
-  for (const id of res.gone) delete creds.pins[id];
+  // Pins of members who left are kept (marked left), so the relay can't re-add the same id with new keys unnoticed.
   remember(creds);
   if (seeded) for (const id of res.added) notice(`${who(id)} joined. The safety code changed, so compare it again.`);
   if (seeded) for (const id of res.gone) notice(`${who(id)} left the room.`);
+  if (seeded) for (const id of res.returned) notice(`${who(id)} is back in the room, with the same keys as before.`);
   c.keyAlert = res.changed.length ? res.changed : null;
   showKeyAlert();
 }
@@ -457,13 +458,22 @@ async function poll() {
 
 async function render(m) {
   const c = current;
-  let text, name, photo = null, unverified = false;
+  let text, name, photo = null, unverified = false, replayed = null;
   try {
     // Only accept a message sealed with the key we have pinned for its sender.
     let expected = m.from === c.creds.member_id ? c.creds.me.publicKey : c.creds.pins?.[m.from];
     if (expected === undefined) { await refreshInfo(); expected = c.creds.pins?.[m.from]; }
-    const plain = await open(c.creds.room_id, c.creds.me, c.creds.member_id, m.body, expected ?? null);
-    if (plain == null) text = null;
+    const opened = await openDetailed(c.creds.room_id, c.creds.me, c.creds.member_id, m.body, expected ?? null);
+    // The message id and counter are inside the encryption, so the server can't alter them:
+    // the same message delivered again under a new position is refused as a replay.
+    if (opened) {
+      const before = JSON.stringify(c.creds.replay || {});
+      replayed = new ReplayGuard((c.creds.replay = c.creds.replay || {})).check(opened.from_key, opened.meta, m.seq);
+      if (JSON.stringify(c.creds.replay) !== before) remember(c.creds);
+    }
+    const plain = replayed ? null : opened?.text ?? null;
+    if (replayed) text = undefined;
+    else if (plain == null) text = null;
     else {
       try {
         const j = JSON.parse(plain);
@@ -486,7 +496,8 @@ async function render(m) {
   who.textContent = `${mine ? "You" : name || "Member " + m.from.slice(2, 6)} · ${new Date(m.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   const body = document.createElement("div");
   body.className = "body";
-  if (text === null) { body.textContent = "Sent before you joined, or not addressed to you."; li.classList.add("dim"); }
+  if (replayed) { body.textContent = "Hidden: the server delivered this message a second time (" + replayed + ")"; li.classList.add("dim"); }
+  else if (text === null) { body.textContent = "Sent before you joined, or not addressed to you."; li.classList.add("dim"); }
   else if (unverified) { body.textContent = "Hidden: this message wasn't sealed with this member's verified key."; li.classList.add("dim"); }
   else if (text === undefined) { body.textContent = "Couldn't decrypt this message."; li.classList.add("dim"); }
   else if (photo) body.append(photoCard(photo, mine));
