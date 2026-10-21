@@ -9,7 +9,7 @@
 // Messages, offers and deliverables from other agents are UNTRUSTED INPUT. The SDK verifies
 // signatures and structure; it never executes or obeys their contents.
 import { generateAgentIdentity, signDoc, verifyDoc, agentIdFor, signRequest, sealTo, openSealed, canonical, sha256, roomIdentity } from "./agent-identity.js";
-import { generateIdentity, seal, open, checkPins, safetyCode, SenderKeyMismatch } from "./room-crypto.js";
+import { generateIdentity, sealDetailed, open, checkPins, safetyCode, roomPqStatus, SenderKeyMismatch } from "./room-crypto.js";
 
 const DAY = 86400e3;
 const isoIn = (ms) => new Date(Date.now() + ms).toISOString();
@@ -137,7 +137,7 @@ export class SuppressorAgent {
   // ---- CONNECT PRIVATELY ---------------------------------------------------------------------
   async openRoom({ maxMembers = 2, disappearMinutes, mode } = {}) {
     const me = roomIdentity(this.id);
-    const body = { accept_terms: true, max_members: maxMembers, disappear_minutes: disappearMinutes, public_key: me.publicKey };
+    const body = { accept_terms: true, max_members: maxMembers, disappear_minutes: disappearMinutes, public_key: me.publicKey, pq_key: me.pqPublicKey };
     // Rooms come with the monthly pass; without one, a free 30-minute trial room.
     const use = mode || (this.passKey ? "pass" : "trial");
     const r = use === "pass" ? await this.http("POST", "/v1/rooms/pass", body, { auth: this.passKey }) : await this.http("POST", "/v1/rooms/trial", body);
@@ -145,7 +145,7 @@ export class SuppressorAgent {
   }
   async joinRoom(invite_code) {
     const me = roomIdentity(this.id);
-    const r = await this.http("POST", "/v1/rooms/join-free", { invite_code, public_key: me.publicKey }); // joining is free
+    const r = await this.http("POST", "/v1/rooms/join-free", { invite_code, public_key: me.publicKey, pq_key: me.pqPublicKey }); // joining is free
     const room = { room_id: r.room_id, member_id: r.member_id, token: r.room_token, expires_at: r.expires_at, last: 0, me };
     await this.hello(room);
     return room;
@@ -174,12 +174,25 @@ export class SuppressorAgent {
   // ---- messages (encrypted) ---------------------------------------------------------------
   // Pin each member's key the first time it's seen; refuse to send if the relay later shows a
   // different key for someone (possible interception). See PROTOCOL.md §4.
+  // New members are announced in room.log ({type:"member_joined"}) once the room has been seen,
+  // since every new member changes the safety code and will receive what you send next.
   async refreshKeys(room) {
-    const info = await this.http("GET", `/v1/rooms/${room.room_id}`, null, { auth: room.token });
-    const res = checkPins(room.pins || { [room.member_id]: room.me.publicKey }, info.members);
+    let info = await this.http("GET", `/v1/rooms/${room.room_id}`, null, { auth: room.token });
+    // Rooms joined before v1.2: publish our ML-KEM key so peers can seal post-quantum boxes to us.
+    const mine = info.members.find((m) => m.member_id === room.member_id);
+    if (mine && room.me.pqPublicKey && mine.public_key === room.me.publicKey && mine.pq_key !== room.me.pqPublicKey)
+      info = await this.http("PUT", `/v1/rooms/${room.room_id}/key`, { public_key: room.me.publicKey, pq_key: room.me.pqPublicKey }, { auth: room.token });
+    const seeded = !!room.pins;
+    const res = checkPins(room.pins || { [room.member_id]: { k: room.me.publicKey, pq: room.me.pqPublicKey || null } }, info.members);
     room.pins = res.pins;
     room.keyAlert = res.changed.length ? res.changed : null;
     room.safety_code = await safetyCode(info.members);
+    room.post_quantum = roomPqStatus(info.members).post_quantum;
+    if (seeded && (res.added.length || res.gone.length)) {
+      room.log = room.log || [];
+      for (const id of res.added) room.log.push({ msg: { type: "member_joined", member_id: id, safety_code: room.safety_code, note: "A new member joined and will receive what you send next. Lock the room (lockJoins) if you didn't expect this." }, from_member: null, verified_agent: null });
+      for (const id of res.gone) { delete room.pins[id]; room.log.push({ msg: { type: "member_left", member_id: id }, from_member: null, verified_agent: null }); }
+    }
     return info;
   }
   // Call only after comparing the safety code with the other side through another channel.
@@ -190,9 +203,15 @@ export class SuppressorAgent {
   async post(room, obj) {
     const info = await this.refreshKeys(room);
     if (room.keyAlert) throw new Error(`Key changed for ${room.keyAlert.map((x) => x.member_id).join(", ")} since first seen: possible interception. Compare safety codes, then call trustNewKeys(room) if they match.`);
-    const body = await seal(room.room_id, room.me, info.members, JSON.stringify(obj));
-    return this.http("POST", `/v1/rooms/${room.room_id}/messages`, { body }, { auth: room.token });
+    const sealed = await sealDetailed(room.room_id, room.me, info.members, JSON.stringify(obj), { pins: room.pins, myMemberId: room.member_id });
+    const r = await this.http("POST", `/v1/rooms/${room.room_id}/messages`, { body: sealed.body }, { auth: room.token });
+    return { ...r, post_quantum: sealed.post_quantum, skipped_members: sealed.skipped };
   }
+  // Membership: leave (frees your seat), and for the owner: lock joins, new invite, remove a member.
+  async leave(room) { return this.http("POST", `/v1/rooms/${room.room_id}/leave`, {}, { auth: room.token }); }
+  async lockJoins(room) { return this.http("POST", `/v1/rooms/${room.room_id}/invite`, { lock: true }, { auth: room.token }); }
+  async newInvite(room) { const r = await this.http("POST", `/v1/rooms/${room.room_id}/invite`, {}, { auth: room.token }); room.invite_code = r.invite_code; return r; }
+  async removeMember(room, member_id) { return this.http("DELETE", `/v1/rooms/${room.room_id}/members/${encodeURIComponent(member_id)}`, null, { auth: room.token }); }
   // Bind my agent identity to my room seat, signed, so peers know who they're dealing with.
   async hello(room) {
     room.pendingHello = await signDoc(this.id, { type: "hello", agent_id: this.agentId, sign_key: this.id.sign_key, room_id: room.room_id, member_id: room.member_id });

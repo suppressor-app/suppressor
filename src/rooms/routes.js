@@ -4,9 +4,17 @@ import express from "express";
 // Joining any room is free. Everything else is free with a room token or the pass key.
 import crypto from "node:crypto";
 import * as S from "./store.js";
+import { isValidPublicKey, isValidPqKey } from "../../clients/room-crypto.js";
 
 const bearer = (req) => (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim() || null;
-const isKey = (k) => k == null || (typeof k === "string" && k.length >= 16 && k.length <= 200 && /^[A-Za-z0-9+/=_-]+$/.test(k));
+// Keys must be exactly what clients can use: a 32-byte X25519 key and, optionally, a valid
+// ML-KEM-768 key (1184 bytes, FIPS 203 modulus check). A malformed key used to be accepted and
+// then break sealing for every other member of the room.
+const isKey = (k) => k == null || isValidPublicKey(k);
+const isPq = (k) => k == null || isValidPqKey(k);
+const KEY_ERR = "public_key must be a base64 X25519 public key (32 bytes, 44 characters)";
+const PQ_ERR = "pq_key must be a base64 ML-KEM-768 encapsulation key (1184 bytes)";
+const keyError = (b) => (!isKey(b.public_key) ? KEY_ERR : !isPq(b.pq_key) ? PQ_ERR : b.pq_key && !b.public_key ? "pq_key needs a public_key too" : null);
 const okDisappear = (v) => v == null || (Number.isInteger(v) && v >= 1 && v <= 1440);
 // Long-poll: hold a read open up to `wait` seconds until there's something new (no busy polling).
 let waiters = 0;
@@ -50,7 +58,7 @@ export const paidRooms = [
     path: "/v1/passes/renew",
     price: "$5",
     title: "Renew the monthly pass (+30 days, $5)",
-    description: `Add ${S.LIMITS.passDays} days to your pass. Its open rooms stay open. Works up to ${S.LIMITS.passGraceDays} days after it expires. Send Authorization: Bearer <pass_key>.`,
+    description: `Add ${S.LIMITS.passDays} days to your pass. Renew before it expires and its open rooms stay open. You can renew up to ${S.LIMITS.passGraceDays} days after it expires to keep your pass key, but rooms end (and are deleted) when the pass expires. Send Authorization: Bearer <pass_key>.`,
     tags: ["subscription", "renewal", "rooms"],
     inputSchema: { type: "object", properties: {}, description: "No body. Send Authorization: Bearer <pass_key>." },
     exampleInput: {},
@@ -173,9 +181,9 @@ export function mountHandlers(app, { adminToken }) {
     const tier = S.tierOf(p);
     if (b.max_members != null && !(Number.isInteger(b.max_members) && b.max_members >= 2 && b.max_members <= tier.max_members)) return bad(res, 400, `max_members must be an integer 2–${tier.max_members} on your ${tier.name} pass`);
     if (!okDisappear(b.disappear_minutes)) return bad(res, 400, "disappear_minutes must be an integer 1–1440");
-    if (!isKey(b.public_key)) return bad(res, 400, "public_key must be base64, 16–200 characters");
+    if (keyError(b)) return bad(res, 400, keyError(b));
     if (S.openPassRooms(p) >= tier.max_open_rooms) return bad(res, 409, `You have ${tier.max_open_rooms} rooms open on your ${tier.name} pass. Close one, on this pass.`);
-    const { room, token, invite, member_id } = S.createRoom({ max_members: b.max_members ?? 2, public_key: b.public_key, disappear_minutes: b.disappear_minutes, pass: p });
+    const { room, token, invite, member_id } = S.createRoom({ max_members: b.max_members ?? 2, public_key: b.public_key, pq_key: b.pq_key, disappear_minutes: b.disappear_minutes, pass: p });
     res.json({
       room_id: room.id, member_id, room_token: token, invite_code: invite, pass: true,
       expires_at: new Date(room.expires_at).toISOString(), max_members: room.max_members, message_limit: null,
@@ -191,11 +199,11 @@ export function mountHandlers(app, { adminToken }) {
     if (paused("trial")) return bad(res, 503, paused("trial"));
     if (b.accept_terms !== true) return bad(res, 400, TERMS_NOTE);
     if (!okDisappear(b.disappear_minutes)) return bad(res, 400, "disappear_minutes must be an integer 1–1440");
-    if (!isKey(b.public_key)) return bad(res, 400, "public_key must be base64, 16–200 characters");
+    if (keyError(b)) return bad(res, 400, keyError(b));
     const q = S.trialQuota(req.ip || "unknown");
     if (!q.ok) return bad(res, q.status, q.error, { subscribe: "POST /v1/passes ($5 / 30 days)" });
     q.record();
-    const { room, token, invite, member_id } = S.createRoom({ public_key: b.public_key, trial: true, disappear_minutes: b.disappear_minutes });
+    const { room, token, invite, member_id } = S.createRoom({ public_key: b.public_key, pq_key: b.pq_key, trial: true, disappear_minutes: b.disappear_minutes });
     res.json({
       room_id: room.id,
       member_id,
@@ -210,7 +218,7 @@ export function mountHandlers(app, { adminToken }) {
         upgrade: "For unlimited rooms and messages, get the monthly pass: POST /v1/passes ($5 / 30 days).",
         send: `POST /v1/rooms/${room.id}/messages with Authorization: Bearer <room_token> and {"body": "<ciphertext>"}`,
         read: `GET /v1/rooms/${room.id}/messages?after=0`,
-        encrypt: "Encrypt bodies end to end. See /clients/room-crypto.js for an X25519 + AES-256-GCM helper.",
+        encrypt: "Encrypt bodies end to end. See /clients/room-crypto.js: hybrid post-quantum (X25519 + ML-KEM-768) with AES-256-GCM. Publish pq_key alongside public_key.",
       },
     });
   });
@@ -220,12 +228,12 @@ export function mountHandlers(app, { adminToken }) {
   app.post(["/v1/rooms/join-free", "/v1/rooms/join", "/v1/rooms/trial/join"], ipLimit, (req, res) => {
     const b = req.body || {};
     if (typeof b.invite_code !== "string") return bad(res, 400, "invite_code required");
-    if (!isKey(b.public_key)) return bad(res, 400, "public_key must be base64, 16–200 characters");
+    if (keyError(b)) return bad(res, 400, keyError(b));
     const r = S.roomByInvite(b.invite_code);
     if (!r) return bad(res, 404, "Invite not found or room expired");
     if (!S.getControls().joins) return bad(res, 503, paused("room-join"));
     if (r.members.length >= r.max_members) return bad(res, 409, "Room is full");
-    const { token, member_id } = S.joinRoom(r, { public_key: b.public_key });
+    const { token, member_id } = S.joinRoom(r, { public_key: b.public_key, pq_key: b.pq_key });
     res.json({ room_id: r.id, member_id, room_token: token, trial: !!r.trial, pass: !!r.pass_hash, expires_at: new Date(r.expires_at).toISOString(), room: S.roomInfo(r, { member_id }) });
   });
 
@@ -273,9 +281,32 @@ export function mountHandlers(app, { adminToken }) {
   });
 
   app.put("/v1/rooms/:id/key", ipLimit, auth, (req, res) => {
-    if (!req.body?.public_key || !isKey(req.body.public_key)) return res.status(400).json({ error: "public_key must be base64, 16–200 characters" });
-    S.setKey(req.member, req.body.public_key);
+    const b = req.body || {};
+    if (!b.public_key || !isKey(b.public_key)) return res.status(400).json({ error: KEY_ERR });
+    if (!isPq(b.pq_key)) return res.status(400).json({ error: PQ_ERR });
+    S.setKey(req.member, b.public_key, b.pq_key);
     res.json(S.roomInfo(req.room, req.member));
+  });
+
+  // Leave: frees your seat and stops messages being sealed to you. The owner closes the room instead.
+  app.post("/v1/rooms/:id/leave", ipLimit, auth, (req, res) => {
+    if (req.member.role === "owner") return res.status(409).json({ error: "The owner can't leave; close the room with DELETE /v1/rooms/:id (or hand it off by opening a new one)." });
+    S.removeMember(req.room, req.member.member_id);
+    res.json({ left: true });
+  });
+  // Owner: remove a member (their token stops working at once).
+  app.delete("/v1/rooms/:id/members/:mid", ipLimit, auth, (req, res) => {
+    if (req.member.role !== "owner") return res.status(403).json({ error: "Only the room owner can remove members" });
+    if (req.params.mid === req.member.member_id) return res.status(409).json({ error: "Close the room instead of removing yourself" });
+    if (!S.removeMember(req.room, req.params.mid)) return res.status(404).json({ error: "No such member" });
+    res.json({ removed: req.params.mid, room: S.roomInfo(req.room, req.member) });
+  });
+  // Owner: replace the invite code (old links stop working), or {lock:true} to stop new joins.
+  app.post("/v1/rooms/:id/invite", ipLimit, auth, (req, res) => {
+    if (req.member.role !== "owner") return res.status(403).json({ error: "Only the room owner can change the invite" });
+    const lock = req.body?.lock === true;
+    const invite = S.rotateInvite(req.room, { lock });
+    res.json({ invite_code: invite, joins_locked: lock });
   });
 
   app.delete("/v1/rooms/:id", ipLimit, auth, (req, res) => {

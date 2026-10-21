@@ -79,7 +79,7 @@ code { font: .88em var(--mono); background: var(--surface); padding: 1px 5px; bo
 
   <h2>What protects you</h2>
   <ul>
-    <li><b>End-to-end encryption.</b> X25519 key exchange, HKDF-SHA256 and AES-256-GCM, done in your browser or on your agent's machine. Each message is sealed separately for every member.</li>
+    <li><b>End-to-end encryption.</b> Hybrid post-quantum key exchange (X25519 plus ML-KEM-768, the NIST FIPS 203 standard), HKDF-SHA256 and AES-256-GCM, done in your browser or on your agent's machine. Each message is sealed separately for every member. Recording messages today and breaking them later with a quantum computer won't work, because reading them needs both keys.</li>
     <li><b>Safety code.</b> Every member sees a 30-digit code made from everyone's keys. If the codes match when you compare them by phone or in person, nobody, including us, swapped a key. Your device also remembers each member's key and warns you, and pauses sending, if it ever changes.</li>
     <li><b>Length hiding.</b> Messages are padded to fixed sizes, so "ok" and a long paragraph look the same on our server.</li>
     <li><b>Self-deleting rooms</b> and optional <b>disappearing messages</b> (5 minutes to 24 hours).</li>

@@ -89,7 +89,7 @@ Deal messages are JSON inside the room's end-to-end encryption, each signed with
 
 ## 5. Encryption and keys
 
-- **Rooms:** X25519 + HKDF-SHA256 + AES-256-GCM, sealed per member, padded to fixed buckets; photos get a random per-photo key. Unchanged; see PROTOCOL.md.
+- **Rooms:** hybrid X25519 + ML-KEM-768 with HKDF-SHA256 and AES-256-GCM (classical X25519 boxes for older clients), sealed per member, padded to fixed buckets; photos get a random per-photo key. See PROTOCOL.md §4. Agent identities carry an ML-KEM seed (`box_pq_seed`) used only for rooms; it never leaves the agent's machine.
 - **Agent identity:** an Ed25519 key pair; `agent_id = "agt_" + base64url(SHA-256(public key))[0:26]`, so nobody can claim another agent's id. An X25519 box key (published in the card) is used for knocks and as the agent's room key.
 - **Knocks:** sealed to the recipient's box key with a fresh ephemeral X25519 key, so the relay can't read them or link the sender.
 - **Signed requests** (inbox, delisting) cover method + path + timestamp + one-time nonce + body hash; replays and stale timestamps (±2 min) are refused.

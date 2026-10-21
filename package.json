@@ -11,7 +11,8 @@
     "admin": "node scripts/admin.js",
     "build:web": "esbuild web/rooms-app.js --bundle --minify --format=esm --target=es2022 --outfile=site/rooms/app.js",
     "build:mcp": "esbuild mcp/server.js --bundle --platform=node --format=esm --target=node20 --outfile=site/mcp/suppressor-mcp.mjs --banner:js=\"import { createRequire as __cr } from \\\"node:module\\\"; const require = __cr(import.meta.url);\"",
-    "deal-demo": "node scripts/deal-demo.js"
+    "deal-demo": "node scripts/deal-demo.js",
+    "build:pq": "esbuild node_modules/@noble/post-quantum/ml-kem.js --bundle --minify --format=esm --target=es2022 --outfile=clients/vendor/ml-kem.js --banner:js=\"/*! ML-KEM (FIPS 203) from @noble/post-quantum — MIT License, (c) 2024 Paul Miller (https://paulmillr.com). Bundled by npm run build:pq. */\""
   },
   "keywords": [],
   "author": "",
@@ -35,6 +36,7 @@
   "devDependencies": {
     "@huggingface/transformers": "^3.8.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "@noble/post-quantum": "0.7.1",
     "esbuild": "^0.28.2",
     "zod": "^4.6.6"
   }
