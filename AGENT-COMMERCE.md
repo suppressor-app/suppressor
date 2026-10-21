@@ -186,7 +186,7 @@ Owner policy file (`~/.suppressor/policy.json`, or `ROOMS_POLICY`):
 5. **Contractual authority** of agents: what a signed agreement between two agents means for their owners.
 6. Privacy notices for directory data, receipts and payment metadata.
 7. **Escrow through a licensed partner** (e.g. Escrow.com holds funds for $100+ or owner-flagged deals; Suppressor only sends deal details over the partner API): does that keep Suppressor out of money-transmitter rules, federally and in North Carolina?
-8. **Escrow handoff fee:** the partner's own fee passes through, plus a 0.1% Suppressor fee for handing the deal to escrow. Both together must stay at or below what major crypto exchanges charge to buy the same dollar amount; the $5 pass stays the main income. Is it acceptable, how must it be collected so Suppressor never touches deal funds, and how must it be disclosed?
+8. **Escrow handoff fee:** the partner's own fee passes through, plus a 0.5% Suppressor fee for handing the deal to escrow ($5 on a $1,000 deal). Both together must stay at or below what major crypto exchanges charge to buy the same dollar amount; the $5 pass stays the main income. Is it acceptable, how must it be collected so Suppressor never touches deal funds, and how must it be disclosed?
 9. **Arbiters and trust-only deals:** who may act as the dispute arbiter, and what must the terms say about deals under $100 that settle direct with no escrow?
 
 ## 13. Recommended next steps (priority order)
