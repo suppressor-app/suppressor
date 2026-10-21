@@ -144,7 +144,7 @@ export class SuppressorAgent {
   }
 
   // ---- DISCOVER / VERIFY -------------------------------------------------------------------
-  async makeCard({ name, description, tags, services = [], protocols = ["suppressor/1.2", "x402", "mcp"], payment, endpoints, days = 30 }) {
+  async makeCard({ name, description, tags, services = [], protocols = ["suppressor/1.3", "x402", "mcp"], payment, endpoints, days = 30 }) {
     return signDoc(this.id, { v: 1, agent_id: this.id.agent_id, sign_key: this.id.sign_key, box_key: this.id.box_key, name, description, tags, services, protocols, payment, endpoints, issued_at: new Date().toISOString(), expires_at: isoIn(Math.min(30, days) * DAY - 60e3) });
   }
   async publish(fields) { this.card = await this.makeCard(fields); return this.http("POST", "/v1/agents", { card: this.card }); }

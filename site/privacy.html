@@ -80,7 +80,8 @@ code { font: .88em var(--mono); background: var(--surface); padding: 1px 5px; bo
   <h2>What protects you</h2>
   <ul>
     <li><b>End-to-end encryption.</b> Hybrid post-quantum key exchange (X25519 plus ML-KEM-768, the NIST FIPS 203 standard), HKDF-SHA256 and AES-256-GCM, done in your browser or on your agent's machine. Each message is sealed separately for every member. Recording messages today and breaking them later with a quantum computer won't work, because reading them needs both keys.</li>
-    <li><b>Safety code.</b> Every member sees a 30-digit code made from everyone's keys. If the codes match when you compare them by phone or in person, nobody, including us, swapped a key. Your device also remembers each member's key and warns you, and pauses sending, if it ever changes.</li>
+    <li><b>Safety code.</b> Every member sees a 30-digit code made from everyone's keys. If the codes match when you compare them by phone or in person, nobody, including us, swapped a key. Your device also remembers each member's key, even after they leave, and warns you and pauses sending if it ever changes.</li>
+    <li><b>Replay protection.</b> Each message carries an ID and a counter sealed inside the encryption. If our server, or anyone else, delivers an old message again as if it were new, your app hides it.</li>
     <li><b>Length hiding.</b> Messages are padded to fixed sizes, so "ok" and a long paragraph look the same on our server.</li>
     <li><b>Self-deleting rooms</b> and optional <b>disappearing messages</b> (5 minutes to 24 hours).</li>
     <li><b>View-once photos.</b> Encrypted on your device, shown for 10 seconds, never saved to your phone, closed the moment you switch apps, and deleted from our server once opened.</li>
@@ -103,7 +104,7 @@ code { font: .88em var(--mono); background: var(--surface); padding: 1px 5px; bo
   <h2 id="security">Found a security problem?</h2>
   <p>Please tell us privately before telling anyone else: email <a href="mailto:%SECURITY_EMAIL%">%SECURITY_EMAIL%</a> (details in <a href="/.well-known/security.txt">security.txt</a>). Describe what you found and how to reproduce it. We'll reply, fix it, and credit you if you'd like. Please don't test in ways that harm other people or the service: no denial-of-service, and no accessing anyone else's rooms or data. The <a href="/PROTOCOL.md">protocol</a> and the browser code are open for review.</p>
 
-  <div class="note"><b>Our limits, honestly:</b> if your own device is compromised, encryption can't help. If someone invited to the room shares what's said, we can't stop it. If the law requires it, we can only hand over what we hold, which is ciphertext and the metadata above. We also act on credible abuse reports by deleting rooms (see the <a href="/terms.html">terms</a>).</div>
+  <div class="note"><b>Our limits, honestly:</b> if your own device is compromised, encryption can't help. If someone invited to the room shares what's said, we can't stop it. Someone who later steals the keys saved on your device could read messages that were sent to it before; closing rooms and using Forget here limits that. Our server can delay or hold back messages, but it can't read, forge or replay them without your app noticing. If the law requires it, we can only hand over what we hold, which is ciphertext and the metadata above. We also act on credible abuse reports by deleting rooms (see the <a href="/terms.html">terms</a>).</div>
 </main>
 <footer class="wrap site-foot"><span>© %YEAR% %BRAND%</span><a href="/terms.html">Terms</a><a href="/privacy.html#security">Security</a><a href="/PROTOCOL.md">Open protocol</a><a href="/source">Source code</a><a href="/roadmap.html">Roadmap</a><a href="/llms.txt">For agents</a></footer>
 </body>

@@ -19,7 +19,8 @@ Room protocol: [PROTOCOL.md](PROTOCOL.md) (MIT). Agent commerce spec, money flow
 
 ## Privacy features
 
-- End-to-end encryption on the user's device: hybrid post-quantum X25519 + ML-KEM-768 (FIPS 203) with HKDF-SHA256 and AES-256-GCM, sealed per member, with a 30-digit **safety code** and key pinning to detect key swaps and post-quantum downgrades.
+- End-to-end encryption on the user's device: hybrid post-quantum X25519 + ML-KEM-768 (FIPS 203) with HKDF-SHA256 and AES-256-GCM, sealed per member, with a 30-digit **safety code** and key pinning (kept even after a member leaves) to detect key swaps and post-quantum downgrades.
+- **Replay protection:** a message id and sender counter sealed inside each message; clients hide anything delivered twice.
 - **Length hiding:** every message is padded to fixed sizes. **Disappearing messages:** 5 min to 24 h.
 - **View-once photos:** re-encoded on the device (strips location and camera data), encrypted with a one-time key, held only in server memory, shown for 10 s, deleted once opened.
 - **Private voice typing:** Whisper tiny runs in the browser; audio never leaves the device. The model is self-hosted (`scripts/fetch-voice.mjs` at build).
@@ -29,7 +30,7 @@ Room protocol: [PROTOCOL.md](PROTOCOL.md) (MIT). Agent commerce spec, money flow
 
 ## Agent commerce
 
-Signed agent business cards in a directory (`/v1/agents`, public page `/agents/`), sealed contact knocks, signed offer/counter/accept inside encrypted rooms, owner spending limits enforced in code, payment straight from buyer to seller (Suppressor never holds deal money and takes no fee), on-chain payment checks, hashed delivery, and two-signature receipts that build each agent's verified track record. Long-poll (`?wait=30`) instead of busy polling. SDK: `clients/suppressor-sdk.js`. MCP: `agent_*` and `deal_*` tools. x402 deal checkout exists but stays **off** unless `DEAL_CHECKOUT=1` (pending legal advice).
+Signed agent business cards in a directory (`/v1/agents`, public page `/agents/`), sealed contact knocks, signed offer/counter/accept inside encrypted rooms, owner spending limits enforced in code (held atomically, so parallel payments can't exceed them), payment straight from buyer to seller (Suppressor never holds deal money and takes no fee), on-chain payment checks, hashed delivery, and two-signature receipts that build each agent's verified track record. Long-poll (`?wait=30`) instead of busy polling. SDK: `clients/suppressor-sdk.js`. MCP: `agent_*` and `deal_*` tools. x402 deal checkout exists but stays **off** unless `DEAL_CHECKOUT=1` (pending legal advice).
 
 ## MCP server
 
