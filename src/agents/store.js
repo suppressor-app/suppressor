@@ -17,6 +17,12 @@ export const AGENT_LIMITS = {
   clockSkewMs: 120e3,
   checkoutMinUsd: 0.01,
   checkoutMaxUsd: 1000,
+  // Whole-server caps, so traffic spread across many inboxes or ids can't exhaust memory or
+  // bloat the snapshot on disk.
+  maxKnockBytesTotal: 64 * 1024 * 1024, // all inboxes together (memory only)
+  maxAgentReports: 5000,               // kept in the snapshot; resolved ones are dropped first
+  maxOpenReportsPerAgent: 20,
+  maxCheckouts: 20000,                 // kept in the snapshot; expired ones are dropped first
 };
 
 const cards = new Map(); // agent_id -> { card, first_listed_at, updated_at }
@@ -25,6 +31,7 @@ const usedTx = new Set(); // payment tx hashes already counted in a receipt
 const agentReports = []; // { id, agent_id, reason, at, status }
 const checkouts = new Map(); // id -> { id, pay_to, amount_usd, ref, created_at, expires_at, status, tx, payer }
 const knocks = new Map(); // agent_id -> [{ id, sealed, at }]  (memory only)
+let knockBytes = 0; // total size of all held knocks
 const nonces = new Map(); // nonce -> expiry
 const reservedTx = new Set(); // tx hashes being checked right now (stops parallel double-use)
 const tombstones = new Map(); // agent_id -> { issued_at, banned }: removed cards can't be replayed
@@ -65,6 +72,7 @@ export function sweep() {
   const t = now();
   for (const [id, c] of cards) if (Date.parse(c.card.expires_at) <= t) { cards.delete(id); dirty = true; }
   for (const [id, list] of knocks) { const keep = list.filter((k) => t - k.at < AGENT_LIMITS.knockHours * 3600e3); keep.length ? knocks.set(id, keep) : knocks.delete(id); }
+  knockBytes = [...knocks.values()].reduce((a, l) => a + l.reduce((b, k) => b + k.sealed.length, 0), 0);
   for (const [n, exp] of nonces) if (exp <= t) nonces.delete(n);
   for (const [id, c] of checkouts) if (c.status === "open" && c.expires_at <= t) { c.status = "expired"; dirty = true; }
   for (const [id, c] of checkouts) if (t - c.created_at > 90 * 86400e3) { checkouts.delete(id); dirty = true; }
@@ -136,7 +144,8 @@ export function removeCard(id, { banned = false } = {}) {
   const c = cards.get(id);
   const prev = tombstones.get(id);
   tombstones.set(id, { issued_at: Math.max(c ? Date.parse(c.card.issued_at) : 0, prev?.issued_at || 0), banned: banned || !!prev?.banned });
-  const ok = cards.delete(id); knocks.delete(id); dirty = true; return ok;
+  dropKnocks(id);
+  const ok = cards.delete(id); dirty = true; return ok;
 }
 export function unbanAgent(id) { const ok = tombstones.delete(id); dirty = true; return ok; }
 
@@ -183,25 +192,40 @@ export const directoryStats = () => ({ listed_agents: cards.size, verified_deals
 export const listAgentsAdmin = () => [...cards.values()].map((c) => ({ agent_id: c.card.agent_id, name: c.card.name, services: c.card.services.length, listed_since: iso(c.first_listed_at), expires_at: c.card.expires_at, ...trustOf(c.card.agent_id) }));
 
 // ---- knocks (sealed contact requests) ---------------------------------------------
+function dropKnocks(agentId) {
+  const list = knocks.get(agentId) || [];
+  knockBytes -= list.reduce((a, k) => a + k.sealed.length, 0);
+  knocks.delete(agentId);
+  return list;
+}
 export function addKnock(agentId, sealed) {
   const list = knocks.get(agentId) || [];
   if (list.length >= AGENT_LIMITS.knocksPerInbox) return { status: 429, error: "This agent's inbox is full. Try again later." };
+  if (knockBytes + sealed.length > AGENT_LIMITS.maxKnockBytesTotal) return { status: 503, error: "Contact requests are busy right now. Try again later." };
   const k = { id: rid("kn_", 9), sealed, at: Math.floor(now() / 60e3) * 60e3 };
   list.push(k);
   knocks.set(agentId, list);
+  knockBytes += sealed.length;
   return { knock_id: k.id };
 }
 export const hasKnocks = (agentId) => (knocks.get(agentId) || []).length > 0;
 export function takeKnocks(agentId) {
-  const list = knocks.get(agentId) || [];
-  knocks.delete(agentId);
-  return list.map((k) => ({ knock_id: k.id, sealed: k.sealed, received_at: iso(k.at) }));
+  return dropKnocks(agentId).map((k) => ({ knock_id: k.id, sealed: k.sealed, received_at: iso(k.at) }));
 }
+export const knockStats = () => ({ inboxes: knocks.size, bytes: knockBytes });
 
 // ---- reports ------------------------------------------------------------------------
+// Bounded like room reports: at most maxOpenReportsPerAgent open per agent (an extra one replaces
+// the oldest open one), and at most maxAgentReports overall (resolved ones go first).
 export function reportAgent(agent_id, reason) {
+  const open = agentReports.filter((x) => x.agent_id === agent_id && x.status === "open");
+  if (open.length >= AGENT_LIMITS.maxOpenReportsPerAgent) agentReports.splice(agentReports.indexOf(open[0]), 1);
   const r = { id: rid("ar_", 8), agent_id, reason, at: iso(now()), status: "open" };
   agentReports.push(r);
+  while (agentReports.length > AGENT_LIMITS.maxAgentReports) {
+    const i = agentReports.findIndex((x) => x.status !== "open");
+    agentReports.splice(i >= 0 ? i : 0, 1);
+  }
   dirty = true;
   return r;
 }
@@ -237,6 +261,11 @@ export function recordDeal({ buyer, seller, amount_usd, tx, outcome }) {
 
 // ---- deal checkouts (x402, buyer pays seller directly) ---------------------------------
 export function createCheckout({ pay_to, amount_usd, ref, expires_minutes = 60 }) {
+  if (checkouts.size >= AGENT_LIMITS.maxCheckouts) {
+    for (const [id, x] of checkouts) if (x.status !== "open" && x.status !== "paid") checkouts.delete(id); // expired first
+    if (checkouts.size >= AGENT_LIMITS.maxCheckouts) for (const [id, x] of checkouts) { if (checkouts.size < AGENT_LIMITS.maxCheckouts) break; if (x.status === "open" && x.expires_at <= now()) checkouts.delete(id); }
+    if (checkouts.size >= AGENT_LIMITS.maxCheckouts) return null;
+  }
   const c = { id: rid("co_", 12), pay_to, amount_usd, ref: ref || null, created_at: now(), expires_at: now() + Math.min(1440, Math.max(5, expires_minutes)) * 60e3, status: "open", tx: null, payer: null };
   checkouts.set(c.id, c);
   dirty = true;
