@@ -276,7 +276,7 @@ export function mountHandlers(app, { adminToken }) {
   });
 
   // Encrypted photos. Body: raw ciphertext (application/octet-stream). ?once=1 for view-once.
-  const rawPhoto = express.raw({ type: "application/octet-stream", limit: S.LIMITS.maxBlobBytes + 1024 });
+  const rawPhoto = express.raw({ type: "application/octet-stream", inflate: false, limit: S.LIMITS.maxBlobBytes + 1024 });
   app.post("/v1/rooms/:id/blobs", ipLimit, auth, rawPhoto, (req, res) => {
     if (!Buffer.isBuffer(req.body)) return res.status(415).json({ error: "Send the encrypted photo as application/octet-stream" });
     const out = S.putBlob(req.room, req.member, req.body, req.query.once === "1");

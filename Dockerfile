@@ -1,4 +1,6 @@
-FROM node:22-slim
+# Pinned to a patched release: Node 22.23.4 fixes the October 21, 2026 security issues (Brotli RCE,
+# TLS hostname-check bypasses, DNS truncation) and drops the compromised eMudhra intermediate CA.
+FROM node:22.23.4-slim
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./

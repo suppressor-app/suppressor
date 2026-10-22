@@ -114,7 +114,14 @@ if (DEAL_CHECKOUT) routes["POST /v1/checkouts/:id/pay"] = checkoutRoute(NETWORK)
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1); // behind Railway/Render/Fly load balancers
-app.use(express.json({ limit: "800kb", verify: (req, res, buf) => { req.rawBody = buf.toString("utf8"); } })); // rawBody: for signed agent requests
+// Refuse compressed request bodies. No Suppressor client sends them, and decompressing attacker-chosen
+// Brotli runs Node's decoder on it (CVE-2026-111497: remote code execution on Node < 22.23.4).
+app.use((req, res, next) => {
+  const ce = String(req.headers["content-encoding"] || "identity").trim().toLowerCase();
+  if (ce !== "identity") return res.status(415).json({ error: "Compressed request bodies aren't accepted. Send the body uncompressed." });
+  next();
+});
+app.use(express.json({ limit: "800kb", inflate: false, verify: (req, res, buf) => { req.rawBody = buf.toString("utf8"); } })); // rawBody: for signed agent requests
 
 // Privacy and security headers on every response. No third-party scripts, fonts or trackers:
 // pages may only load files from this server, and never send a Referer to other sites.
