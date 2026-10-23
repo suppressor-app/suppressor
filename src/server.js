@@ -17,6 +17,7 @@ import * as AgentStore from "./agents/store.js";
 import { mountAgents, checkoutRoute } from "./agents/routes.js";
 import cryptoNode from "node:crypto";
 import { BRAND, brandText } from "./brand.js";
+import { pickLang, localizePage } from "./i18n.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -347,8 +348,16 @@ app.use((req, res, next) => {
   for (const base of [SITE, path.join(ROOT, "public")]) {
     const file = path.join(base, rel);
     if (!file.startsWith(base) || !fs.existsSync(file)) continue;
-    if (!htmlCache.has(file) || process.env.DEV_SKIP_PAYMENTS === "1") htmlCache.set(file, brandText(fs.readFileSync(file, "utf8"), { PUBLIC_URL, SERVICE: SERVICE_NAME, CONTACT, SECURITY_EMAIL }));
-    return res.type("html").send(htmlCache.get(file));
+    // Owner-only pages stay in English; everything else is shown in the visitor's language.
+    const lang = rel.startsWith("/admin/") ? "en" : pickLang(req.query.lang, req.get("accept-language"));
+    const key = `${file}|${lang}`;
+    if (!htmlCache.has(key) || process.env.DEV_SKIP_PAYMENTS === "1") {
+      let html = fs.readFileSync(file, "utf8");
+      if (!rel.startsWith("/admin/")) html = localizePage(html, lang, { url: req.path, publicUrl: PUBLIC_URL });
+      htmlCache.set(key, brandText(html, { PUBLIC_URL, SERVICE: SERVICE_NAME, CONTACT, SECURITY_EMAIL }));
+    }
+    res.vary("Accept-Language").set("Content-Language", lang);
+    return res.type("html").send(htmlCache.get(key));
   }
   next();
 });

@@ -20,14 +20,14 @@ p, li { color: #ddd3ee; line-height: 1.7; }
 .split > div { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 20px 22px; }
 .split h3 { margin: 0 0 10px; font: 600 .78rem var(--mono); letter-spacing: .12em; text-transform: uppercase; }
 .cant h3 { color: var(--ok); } .can h3 { color: var(--warm); }
-.split ul { margin: 0; padding-left: 1.1em; }
+.split ul { margin: 0; padding-inline-start: 1.1em; }
 .split li { margin: 6px 0; }
 table { width: 100%; border-collapse: collapse; font-size: .95rem; }
-th, td { text-align: left; padding: 11px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th, td { text-align: start; padding: 11px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
 th { color: var(--steel); font: 500 .72rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
 td:first-child { color: var(--ink); font-weight: 600; width: 32%; }
 .tips li { margin: 8px 0; }
-.note { background: var(--accent-soft); border: 1px solid var(--rule); border-left: 3px solid var(--accent); padding: 14px 16px; border-radius: 0 10px 10px 0; margin: 22px 0; }
+.note { background: var(--accent-soft); border: 1px solid var(--rule); border-inline-start: 3px solid var(--accent); padding: 14px 16px; border-radius: 10px; border-start-start-radius: 0; border-end-start-radius: 0; margin: 22px 0; }
 code { font: .88em var(--mono); background: var(--surface); padding: 1px 5px; border-radius: 4px; }
 @media (max-width: 720px) { .split { grid-template-columns: 1fr; } }
 </style>

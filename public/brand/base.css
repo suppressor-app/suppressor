@@ -37,3 +37,10 @@ a:hover { text-decoration: underline; }
 .site-foot { color: var(--steel); font: .75rem var(--mono); padding: 28px 0 36px; display: flex; gap: 18px; flex-wrap: wrap; border-top: 1px solid var(--rule); margin-top: 56px; }
 .site-foot a { color: var(--muted); }
 .site-notice { background: linear-gradient(90deg, rgba(168,85,247,.22), rgba(109,40,217,.18)); border-bottom: 1px solid var(--accent); color: var(--ink); font-size: .92rem; padding: 10px 16px; text-align: center; }
+/* Languages: the switcher, the "English controls" notice on translated pages, and scripts that
+   letter-spacing or capitals would break. Layout uses start/end, so Arabic mirrors on its own. */
+.lang-pick { font: 500 .78rem var(--mono); color: var(--muted); background: var(--bg-elev); border: 1px solid var(--rule); border-radius: 99px; padding: 5px 10px; cursor: pointer; max-width: 11em; }
+.lang-float { float: inline-end; margin-top: 2px; }
+.i18n-note { background: var(--surface); border-bottom: 1px solid var(--rule); color: var(--muted); font-size: .82rem; padding: 8px 16px; text-align: center; }
+:lang(ar) *, :lang(ko) *, :lang(ja) *, :lang(zh-Hant) * { letter-spacing: 0 !important; }
+:lang(ar) body, :lang(ar) .btn { font-family: system-ui, "Segoe UI", Tahoma, sans-serif; }

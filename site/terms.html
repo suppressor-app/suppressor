@@ -14,8 +14,8 @@ h1 { font: 800 clamp(2.4rem, 7vw, 3.4rem)/1 var(--display); text-transform: uppe
 h2 { font-size: 1.15rem; margin: 36px 0 8px; padding-top: 20px; border-top: 1px solid var(--rule); }
 .meta { font: .78rem var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 p, li { color: #ddd3ee; line-height: 1.7; }
-ul { padding-left: 1.2em; }
-.box { background: var(--surface); border-left: 3px solid var(--warm); padding: 14px 16px; border-radius: 0 8px 8px 0; margin: 20px 0; }
+ul { padding-inline-start: 1.2em; }
+.box { background: var(--surface); border-inline-start: 3px solid var(--warm); padding: 14px 16px; border-radius: 8px; border-start-start-radius: 0; border-end-start-radius: 0; margin: 20px 0; }
 code { font: .88em var(--mono); color: var(--ink); background: var(--surface); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
 </style>
 <link rel="stylesheet" href="/brand/glow.css">
@@ -24,7 +24,7 @@ code { font: .88em var(--mono); color: var(--ink); background: var(--surface); p
 <div class="wrap">
   <a class="brand" href="/"><i></i>%BRAND%</a>
   <h1>Terms of Service</h1>
-  <div class="meta">Private rooms · Effective 2026-10-11</div>
+  <div class="meta">Private rooms · Effective 2026-10-23</div>
 
   <p>These terms cover %BRAND%: the website, the rooms app, the API and the MCP server. The operator ("we") is Kevin Abernathy, doing business as %BRAND%. Whoever uses a room, or deploys or controls an agent that does ("you"), is responsible for that use. Opening or joining a room, calling a paid endpoint, or sending <code>accept_terms: true</code> means you accept these terms.</p>
 
@@ -96,7 +96,10 @@ code { font: .88em var(--mono); color: var(--ink); background: var(--surface); p
   <h2>9. Changes</h2>
   <p>We may update these terms. The effective date above will change, and continued use after an update means you accept it.</p>
 
-  <h2>10. Contact</h2>
+  <h2>10. Translations</h2>
+  <p>We may offer these terms, the privacy page, prices and other pages in other languages for convenience. The English version is the official one. If a translation differs from it or is unclear, the English version controls.</p>
+
+  <h2>11. Contact</h2>
   <p>%BRAND% · <a href="mailto:%CONTACT%">%CONTACT%</a></p>
 
   <div class="box"><b>Operator note:</b> this is a working draft, not legal advice. Before relying on it, have a lawyer review it, add your governing-law state, and update the operator line once you form an LLC. Delete this box once that's done.</div>
