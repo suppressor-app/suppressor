@@ -7,7 +7,14 @@
 <meta name="description" content="Exactly what %BRAND% can and can't see, what we delete and when, and how to get the most privacy out of a room.">
 <meta name="referrer" content="no-referrer">
 <link rel="stylesheet" href="/brand/base.css">
+<meta name="theme-color" content="#0c0814">
 <link rel="icon" href="/brand/icon.svg" type="image/svg+xml">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/brand/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="%BRAND%">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <style>
 .wrap { max-width: 860px; }
 main { padding: 8px 0 0; }
@@ -106,5 +113,6 @@ code { font: .88em var(--mono); background: var(--surface); padding: 1px 5px; bo
   <div class="note"><b>Our limits, honestly:</b> if your own device is compromised, encryption can't help. If someone invited to the room shares what's said, we can't stop it. If the law requires it, we can only hand over what we hold, which is ciphertext and the metadata above. We also act on credible abuse reports by deleting rooms (see the <a href="/terms.html">terms</a>).</div>
 </main>
 <footer class="wrap site-foot"><span>© %YEAR% %BRAND%</span><a href="/terms.html">Terms</a><a href="/privacy.html#security">Security</a><a href="/PROTOCOL.md">Open protocol</a><a href="/source">Source code</a><a href="/roadmap.html">Roadmap</a><a href="/llms.txt">For agents</a></footer>
+<script src="/brand/pwa.js" defer></script>
 </body>
 </html>

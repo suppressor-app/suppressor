@@ -121,7 +121,7 @@ app.use(express.json({ limit: "800kb", verify: (req, res, buf) => { req.rawBody 
 const HTTPS = PUBLIC_URL.startsWith("https://");
 app.use((req, res, next) => {
   res.set({
-    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; media-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; media-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" + (HTTPS ? "; upgrade-insecure-requests" : ""),
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -360,6 +360,28 @@ if (ROOMS) {
 // Voice-typing model + runtime (downloaded at build time): compressed, cached by browsers for 30 days.
 if (ROOMS) app.use("/voice", compression(), express.static(path.join(SITE, "voice"), { maxAge: "30d", immutable: true, setHeaders: (res, f) => { if (f.endsWith(".mjs")) res.type("text/javascript"); } }));
 app.get("/favicon.ico", (req, res) => res.redirect(301, "/brand/icon.svg"));
+// Installable app ("Add to Home Screen"): opens straight into rooms, full screen, no browser bar.
+const manifest = () => ({
+  id: "/rooms/",
+  name: BRAND.name,
+  short_name: BRAND.name,
+  description: BRAND.tagline,
+  start_url: "/rooms/",
+  scope: "/",
+  display: "standalone",
+  background_color: "#0c0814",
+  theme_color: "#0c0814",
+  categories: ["social", "productivity", "security"],
+  icons: [
+    { src: "/brand/icon.svg", sizes: "any", type: "image/svg+xml" },
+    { src: "/brand/icon-192.png", sizes: "192x192", type: "image/png" },
+    { src: "/brand/icon-512.png", sizes: "512x512", type: "image/png" },
+    { src: "/brand/icon-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+  ],
+});
+app.get("/manifest.webmanifest", (req, res) => res.type("application/manifest+json").set("Cache-Control", "no-cache").send(JSON.stringify(manifest())));
+// The service worker must be re-checked on every open so app updates (and security fixes) land at once.
+app.get("/sw.js", (req, res) => res.type("text/javascript").set({ "Cache-Control": "no-cache", "Service-Worker-Allowed": "/" }).sendFile(path.join(SITE, "sw.js")));
 app.use(express.static(SITE));
 app.use(express.static(path.join(ROOT, "public")));
 
