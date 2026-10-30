@@ -1,0 +1,35 @@
+# Opens one "security-alert" issue per kind of problem (no repeat issues every 30 minutes),
+# pushes to the ntfy phone app if a topic is set, and closes the issue when the problem clears.
+name: Security alert
+description: Open or close a security-alert issue and send a phone push
+inputs:
+  title: { required: true, description: Issue title }
+  failed: { required: true, description: "'true' if the check found problems" }
+  details: { required: false, default: "", description: Markdown list of problems }
+  ntfy-topic: { required: false, default: "", description: ntfy.sh topic for phone pushes }
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TITLE: ${{ inputs.title }}
+        FAILED: ${{ inputs.failed }}
+        DETAILS: ${{ inputs.details }}
+        NTFY_TOPIC: ${{ inputs.ntfy-topic }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        push() { [ -n "$NTFY_TOPIC" ] && curl -sS -m 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -H "Click: $4" -d "$5" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null || true; }
+        gh label create security-alert --color B60205 --description "Opened by the security watch" --force >/dev/null 2>&1 || true
+        open=$(gh issue list --label security-alert --state open --json number,title --jq "map(select(.title == env.TITLE))[0].number // empty")
+        if [ "$FAILED" = true ]; then
+          if [ -n "$open" ]; then echo "Still failing; issue #$open is already open."; exit 0; fi
+          body=$(printf '%s\n\n%s\n\n[See the full check](%s). This issue closes itself when the problem clears.' \
+            "The security watch found a problem:" "${DETAILS:-See the run log.}" "$RUN_URL")
+          url=$(gh issue create --title "$TITLE" --label security-alert --body "$body")
+          echo "Opened $url"
+          push "$TITLE" urgent "rotating_light" "$url" "$(printf '%s' "${DETAILS:-See GitHub}" | sed 's/\*\*//g' | head -c 1500)"
+        elif [ -n "$open" ]; then
+          gh issue close "$open" --comment "Cleared: the latest check passed ([run]($RUN_URL))."
+          push "Cleared: $TITLE" default "white_check_mark" "$RUN_URL" "The latest check passed."
+        fi

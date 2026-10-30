@@ -1,0 +1,22 @@
+# CodeQL reads the code looking for security bugs (injection, unsafe input handling, leaks).
+# Findings appear in the repository's Security tab; GitHub emails the owner about new ones.
+name: CodeQL
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * *" # daily, so newly published attack patterns are checked against old code too
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
