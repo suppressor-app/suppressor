@@ -1,0 +1,108 @@
+# Round-the-clock security watch. When something looks wrong it opens a GitHub issue labelled
+# "security-alert" (GitHub emails and phone-notifies the repo owner) and, if the NTFY_TOPIC secret is set,
+# sends an instant push to the ntfy phone app. When the problem clears, the issue closes itself.
+#
+# Settings (repo Settings > Secrets and variables > Actions):
+#   variable SITE_URL      the live site, e.g. https://suppressor.app (live checks are skipped until it's set)
+#   variable DEPLOY_BRANCH the branch the live site is deployed from (default: main)
+#   secret   NTFY_TOPIC    optional: a long random ntfy.sh topic name for instant phone alerts
+name: Security watch
+on:
+  schedule:
+    - cron: "*/30 * * * *" # live site: up, untampered, headers intact
+    - cron: "23 7 * * *"   # daily deep scan: vulnerable packages and leaked keys
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  issues: write
+concurrency:
+  group: security-watch-${{ github.event.schedule || github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    if: vars.SITE_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ vars.DEPLOY_BRANCH || 'main' }}
+          path: deployed
+      - name: Allow for a deploy still rolling out
+        working-directory: deployed
+        run: |
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -lt 1200 ]; then echo "RECENT_DEPLOY=1" >> "$GITHUB_ENV"; fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: check
+        name: Check the live site
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          set -o pipefail
+          node scripts/security-watch.mjs deployed 2>&1 | tee watch.txt
+      - id: summary
+        if: always() && steps.check.outcome == 'failure'
+        run: |
+          eof="EOF_$(openssl rand -hex 16)"
+          { echo "problems<<$eof"; sed -n '/^PROBLEMS:$/,$p' watch.txt | tail -n +2 | head -c 6000; echo; echo "$eof"; } >> "$GITHUB_OUTPUT"
+      - if: always() && steps.check.outcome != 'skipped'
+        uses: ./.github/actions/alert
+        with:
+          title: "Security alert: live site"
+          failed: ${{ steps.check.outcome == 'failure' }}
+          details: ${{ steps.summary.outputs.problems }}
+          ntfy-topic: ${{ secrets.NTFY_TOPIC }}
+
+  deep:
+    if: github.event.schedule != '*/30 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: audit
+        name: Known security holes in the packages the server uses
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          node scripts/audit-check.mjs 2>&1 | tee audit.txt
+      - id: secrets
+        name: Passwords or keys committed to the code (whole history; only keys proven live are reported)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:latest git file:///repo --only-verified --fail --no-update 2>&1 | tee secrets.txt
+      - id: summary
+        if: always()
+        run: |
+          eof="EOF_$(openssl rand -hex 16)"
+          {
+            echo "problems<<$eof"
+            if [ "${{ steps.audit.outcome }}" = failure ]; then
+              echo "- **A package the server uses has a known high-severity security hole.** Dependabot will usually open a fix PR; if not, ask Claude to update it (or to review and accept it in .github/audit-allow.txt)."
+              echo '```'; tail -n 40 audit.txt; echo '```'
+            fi
+            if [ "${{ steps.secrets.outcome }}" = failure ]; then
+              echo "- **A working password or API key was found in the code history.** Change that key with its provider right away (a deleted file stays in history), then ask Claude to clean up."
+              echo '```'; grep -E 'Detector Type|File|Line|Commit' secrets.txt | head -n 40; echo '```'
+            fi
+            echo "$eof"
+          } >> "$GITHUB_OUTPUT"
+      - if: always()
+        uses: ./.github/actions/alert
+        with:
+          title: "Security alert: code scan"
+          failed: ${{ steps.audit.outcome == 'failure' || steps.secrets.outcome == 'failure' }}
+          details: ${{ steps.summary.outputs.problems }}
+          ntfy-topic: ${{ secrets.NTFY_TOPIC }}

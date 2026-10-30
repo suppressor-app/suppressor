@@ -1,0 +1,3 @@
+# Advisories the daily scan has been told to accept, one GHSA id per line, each with the reason and
+# the date it was reviewed. Remove a line once the fix is installed. Keep this list short.
+GHSA-mrhx-c7xc-m3w5  # zod 3 memory exhaustion. Only reached via @coinbase/x402 -> @coinbase/cdp-sdk, which validates Coinbase's own API replies, never user input; no zod 3 fix exists. Reviewed 2026-10-30.
