@@ -79,8 +79,9 @@ jobs:
       - id: summary
         if: always()
         run: |
+          eof="EOF_$(openssl rand -hex 16)"
           {
-            echo 'problems<<EOF_PROBLEMS'
+            echo "problems<<$eof"
             if [ "${{ steps.audit.outcome }}" = failure ]; then
               echo "- **A package the server uses has a known high-severity security hole.** Dependabot will usually open a fix PR; if not, ask Claude to update it (or to review and accept it in .github/audit-allow.txt)."
               echo '```'; tail -n 40 audit.txt; echo '```'
@@ -89,7 +90,7 @@ jobs:
               echo "- **A working password or API key was found in the code history.** Change that key with its provider right away (a deleted file stays in history), then ask Claude to clean up."
               echo '```'; grep -E 'Detector Type|File|Line|Commit' secrets.txt | head -n 40; echo '```'
             fi
-            echo 'EOF_PROBLEMS'
+            echo "$eof"
           } >> "$GITHUB_OUTPUT"
       - if: always()
         uses: ./.github/actions/alert

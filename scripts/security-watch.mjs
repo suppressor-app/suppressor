@@ -38,7 +38,7 @@ try {
   const r = await get("/");
   const src = fs.readFileSync(path.join(DIR, "src/server.js"), "utf8");
   const want = src.match(/"Content-Security-Policy": "([^"]+)"/)?.[1];
-  const csp = (r.headers.get("content-security-policy") || "").replace(/; upgrade-insecure-requests$/, "");
+  const csp = (r.headers.get("content-security-policy") || "").replace(/[^\x20-\x7e]/g, "?").slice(0, 2000).replace(/; upgrade-insecure-requests$/, "");
   if (want && csp !== want) problems.push(`The Content-Security-Policy header doesn't match the code.\n  expected: ${want}\n  live:     ${csp || "(missing)"}`);
   for (const [k, v] of [["x-frame-options", "DENY"], ["x-content-type-options", "nosniff"], ["referrer-policy", "no-referrer"]])
     if (r.headers.get(k) !== v) problems.push(`Security header ${k} is "${r.headers.get(k) ?? "missing"}", expected "${v}".`);
@@ -94,7 +94,9 @@ console.log(`Checked ${SITE}: ${notes.join("; ")}`);
 if (problems.length) {
   const out = problems.map((p) => `- ${p}`).join("\n");
   console.log(`\nPROBLEMS:\n${out}`);
-  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `problems<<EOF_PROBLEMS\n${out}\nEOF_PROBLEMS\n`);
+  // Live-site text ends up in this output, so use an unguessable delimiter: a crafted header can't end the value early.
+  const eof = `EOF_${crypto.randomUUID()}`;
+  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `problems<<${eof}\n${out}\n${eof}\n`);
   process.exit(1);
 }
 console.log("All clear.");
