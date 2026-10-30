@@ -2,7 +2,7 @@
 //   SITE_URL=https://example.app node scripts/security-watch.mjs [deployed-checkout-dir]
 // Checks: the site is up; payments haven't been switched off; the security headers (CSP etc.) are intact;
 // the JavaScript the site sends browsers is byte-for-byte the code in the repo; the HTTPS certificate isn't expiring.
-// Exits 1 with a plain-English list of problems if anything is wrong.
+// Exits 1 with a plain-English list of problems (after a "PROBLEMS:" line) if anything is wrong.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -92,11 +92,7 @@ if (SITE.startsWith("https://")) {
 
 console.log(`Checked ${SITE}: ${notes.join("; ")}`);
 if (problems.length) {
-  const out = problems.map((p) => `- ${p}`).join("\n");
-  console.log(`\nPROBLEMS:\n${out}`);
-  // Live-site text ends up in this output, so use an unguessable delimiter: a crafted header can't end the value early.
-  const eof = `EOF_${crypto.randomUUID()}`;
-  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `problems<<${eof}\n${out}\n${eof}\n`);
+  console.log(`\nPROBLEMS:\n${problems.map((p) => `- ${p}`).join("\n")}`);
   process.exit(1);
 }
 console.log("All clear.");

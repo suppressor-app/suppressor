@@ -44,13 +44,20 @@ jobs:
         name: Check the live site
         env:
           SITE_URL: ${{ vars.SITE_URL }}
-        run: node scripts/security-watch.mjs deployed
+        run: |
+          set -o pipefail
+          node scripts/security-watch.mjs deployed 2>&1 | tee watch.txt
+      - id: summary
+        if: always() && steps.check.outcome == 'failure'
+        run: |
+          eof="EOF_$(openssl rand -hex 16)"
+          { echo "problems<<$eof"; sed -n '/^PROBLEMS:$/,$p' watch.txt | tail -n +2 | head -c 6000; echo; echo "$eof"; } >> "$GITHUB_OUTPUT"
       - if: always() && steps.check.outcome != 'skipped'
         uses: ./.github/actions/alert
         with:
           title: "Security alert: live site"
           failed: ${{ steps.check.outcome == 'failure' }}
-          details: ${{ steps.check.outputs.problems }}
+          details: ${{ steps.summary.outputs.problems }}
           ntfy-topic: ${{ secrets.NTFY_TOPIC }}
 
   deep:
